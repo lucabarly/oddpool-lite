@@ -17,7 +17,7 @@ KALSHI_BASE_ALT = "https://external-api.kalshi.com/trade-api/v2"
 
 st.set_page_config(page_title="Oddpool Lite Scanner", layout="wide")
 st.title("Oddpool Lite - Scanner automatico opportunita'")
-st.caption("Versione aggiornata: debug pulito + matching strutturato strict + profitto YES+NO")
+st.caption("Versione aggiornata: Kalshi single-market only + Polymarket pagination fix")
 st.caption(
     "Scanner gratuito Polymarket/Kalshi: trova mercati simili, legge top-of-book e calcola edge teorico. "
     "Non e' consulenza finanziaria e non esegue trade automatici."
@@ -328,7 +328,7 @@ def has_any_phrase(s: str, phrases: set) -> bool:
             if p in s:
                 return True
         else:
-            if re.search(r"\\b" + re.escape(p) + r"\\b", s):
+            if re.search(r"\b" + re.escape(p) + r"\b", s):
                 return True
     return False
 
@@ -346,7 +346,7 @@ def is_draw_market(s: str) -> bool:
 def market_family_from_text(s: str) -> str:
     stxt = canonical_text_for_rules(s)
 
-    if re.search(r"\\b(bitcoin|btc|ethereum|eth|solana|sol|crypto)\\b", stxt):
+    if re.search(r"\b(bitcoin|btc|ethereum|eth|solana|sol|crypto)\b", stxt):
         return "crypto"
 
     if has_any_phrase(stxt, MACRO_WORDS):
@@ -359,31 +359,102 @@ def market_family_from_text(s: str) -> str:
 
 
 def is_strictly_bad_kalshi(m: Dict[str, Any]) -> bool:
+    """
+    Filtro aggressivo: accetta solo mercati Kalshi che sembrano single-market.
+    Esclude bundle, multi-event, cross-category, liste di outcome e ticker sport multi-game.
+    """
     ticker = str(m.get("ticker") or "").upper()
     series = str(m.get("series_ticker") or "").upper()
     event = str(m.get("event_ticker") or "").upper()
-    txt = kalshi_display_question(m).lower()
 
-    joined = " ".join([ticker, series, event])
-    hard_bad = ["MULTIGAME", "CROSSCATEGORY", "CROSS_CATEGORY", "PARLAY", "COMBO", "KXMVECROSSCATEGORY", "KXMVESPORTSMULTIGAME"]
-    if any(x in joined for x in hard_bad):
+    title = str(m.get("title") or "")
+    subtitle = str(m.get("subtitle") or "")
+    yes_sub = str(m.get("yes_sub_title") or "")
+    no_sub = str(m.get("no_sub_title") or "")
+    display = kalshi_display_question(m)
+
+    txt = f"{title} {subtitle} {yes_sub} {no_sub} {display}".lower()
+    joined_tickers = " ".join([ticker, series, event])
+
+    hard_bad_ticker_parts = [
+        "MULTIGAME",
+        "CROSSCATEGORY",
+        "CROSS_CATEGORY",
+        "PARLAY",
+        "COMBO",
+        "BUNDLE",
+        "KXMVECROSSCATEGORY",
+        "KXMVESPORTSMULTIGAME",
+        "KXMVEMULTIGAME",
+    ]
+
+    if any(x in joined_tickers for x in hard_bad_ticker_parts):
         return True
 
-    if txt.count(",") >= 2:
+    # Kalshi bundle spesso appare come: "yes Brazil,yes USA,yes Tie..."
+    compact = re.sub(r"\s+", " ", txt).strip()
+
+    if compact.count(",") >= 1 and len(re.findall(r"\b(yes|no)\b", compact)) >= 2:
         return True
 
-    if len(re.findall(r"\b(yes|no)\b", txt)) >= 4:
+    if len(re.findall(r"\b(yes|no)\b", compact)) >= 3:
         return True
 
-    if len(txt.split()) > 32:
+    # Titoli con molte virgole sono quasi sempre liste di outcome.
+    if compact.count(",") >= 2:
+        return True
+
+    # Troppi separatori verticali indicano composizione di campi multipli molto rumorosa.
+    if display.count("|") >= 4:
+        return True
+
+    # Troppi team noti nello stesso mercato = probabile multi-event.
+    teams = extract_teams(compact)
+    if len(teams) >= 4:
+        return True
+
+    # Se ci sono molte parole "wins by / over" ripetute, e' quasi sempre un builder/bundle.
+    repeated_market_terms = len(re.findall(r"\b(wins by|over|under|both teams to score|tie)\b", compact))
+    if repeated_market_terms >= 4:
+        return True
+
+    # Titoli troppo lunghi: spesso aggregati multi-event.
+    if len(compact.split()) > 28:
         return True
 
     return False
 
 
+def kalshi_single_market_reason(m: Dict[str, Any]) -> str:
+    ticker = str(m.get("ticker") or "").upper()
+    title = str(m.get("title") or "")
+    display = kalshi_display_question(m)
+    txt = f"{title} {display}".lower()
+
+    if any(x in ticker for x in ["MULTIGAME", "CROSSCATEGORY", "CROSS_CATEGORY", "PARLAY", "COMBO", "BUNDLE"]):
+        return "ticker Kalshi multi/bundle"
+
+    if txt.count(",") >= 1 and len(re.findall(r"\b(yes|no)\b", txt)) >= 2:
+        return "lista outcome yes/no"
+
+    if len(re.findall(r"\b(yes|no)\b", txt)) >= 3:
+        return "troppi outcome yes/no"
+
+    if len(extract_teams(txt)) >= 4:
+        return "troppi team nello stesso mercato"
+
+    if txt.count(",") >= 2:
+        return "troppe virgole/lista outcome"
+
+    if len(txt.split()) > 28:
+        return "titolo Kalshi troppo lungo"
+
+    return "Kalshi non single-market"
+
+
 def structured_pair_ok(pm: Dict[str, Any], km: Dict[str, Any], mode: str) -> Tuple[bool, str]:
     if is_strictly_bad_kalshi(km) or is_bad_kalshi_market(km):
-        return False, "Kalshi bundle/multigame/crosscategory"
+        return False, kalshi_single_market_reason(km)
 
     ptxt = text_of_market(pm)
     ktxt = kalshi_matching_text(km)
@@ -542,29 +613,43 @@ def get_polymarket_markets(query: str = "", max_download: int = 3000) -> List[Di
                 except Exception:
                     pass
 
-    page_size = 500
+    # Gamma API spesso limita le risposte a 100 mercati per pagina anche se chiediamo di piu'.
+    # Per questo usiamo page_size=100 e paginiamo finche' raggiungiamo max_download.
+    page_size = 100
     offset = 0
-    while offset < max_download:
+    empty_pages = 0
+
+    while len(results) < max_download:
         try:
             params = {
-                "limit": page_size,
+                "limit": min(page_size, max_download - len(results)),
                 "offset": offset,
                 "active": "true",
                 "closed": "false",
                 "order": "volume24hr",
                 "ascending": "false",
             }
-            r = session.get(f"{POLY_GAMMA}/markets", params=params, timeout=15)
+
+            r = session.get(f"{POLY_GAMMA}/markets", params=params, timeout=20)
             r.raise_for_status()
+
             data = r.json()
             batch = data if isinstance(data, list) else data.get("markets", [])
             batch = [x for x in batch if isinstance(x, dict)]
+
             if not batch:
-                break
+                empty_pages += 1
+                if empty_pages >= 2:
+                    break
+                offset += page_size
+                continue
+
             results.extend(batch)
             offset += len(batch)
+
             if len(batch) < page_size:
                 break
+
         except Exception:
             break
 
@@ -1044,7 +1129,7 @@ with tab_scan:
         "Lo scanner prova a trovare mercati simili tra le due piattaforme e calcola un edge teorico. "
         "Le opportunita' con confidence Media/Bassa vanno verificate manualmente: wording e regole di settlement possono essere diversi."
     )
-    st.info("Nuova logica: non confronta piu' tutto contro tutto. Filtra per famiglia di mercato, squadre/date/soglie e scarta bundle Kalshi.")
+    st.info("Nuova logica: Kalshi single-market only. I bundle/multi-event vengono scartati prima del matching.")
 
     if st.button("Avvia scanner", type="primary"):
         with st.spinner("Scarico mercati Polymarket e Kalshi..."):
@@ -1057,7 +1142,17 @@ with tab_scan:
             poly_sorted = sorted(poly_filtered, key=lambda m: to_float(m.get("volume24hr") or m.get("liquidity") or 0), reverse=True)[:top_poly]
             kalshi_sorted = sorted(kalshi_filtered, key=lambda m: to_float(m.get("volume") or m.get("liquidity") or 0), reverse=True)[:top_kalshi]
 
-        st.info(f"Dataset: {len(poly_sorted)} Polymarket usati su {len(poly_all)} scaricati; {len(kalshi_sorted)} Kalshi usati su {len(kalshi_all)} validi dopo filtro anti-falsi positivi.")
+        st.info(
+            f"Dataset: {len(poly_sorted)} Polymarket usati su {len(poly_all)} scaricati; "
+            f"{len(kalshi_sorted)} Kalshi usati su {len(kalshi_all)} single-market validi; "
+            f"{kalshi_removed} Kalshi bundle/multi scartati."
+        )
+        if len(poly_all) <= 100 and poly_download > 100:
+            st.warning(
+                "Polymarket ha restituito solo 100 mercati anche se lo slider richiede di piu'. "
+                "Clicca 'Svuota cache / aggiorna dati'. Se resta cosi', probabilmente Gamma API sta limitando la risposta per il filtro scelto."
+            )
+
         if not poly_sorted or not kalshi_sorted:
             st.warning("Pochi dati trovati. Prova filtro vuoto oppure una keyword piu' ampia: crypto, election, fed, inflation.")
         else:
@@ -1113,8 +1208,11 @@ with tab_scan:
                     mime="text/csv",
                 )
 
-            with st.expander("Pair scartati - solo per diagnosi"):
-                st.caption("Questi sono i confronti respinti. Non usarli come opportunita'.")
+            with st.expander("Pair scartati - solo per diagnosi avanzata"):
+                st.caption(
+                    "Questi sono confronti respinti. Per evitare confusione, non usarli come opportunita'. "
+                    "Aprili solo se vuoi capire cosa e' stato eliminato."
+                )
                 if rejected_df.empty:
                     st.info("Nessun pair scartato.")
                 else:
@@ -1123,7 +1221,9 @@ with tab_scan:
                         "similarity", "polymarket", "kalshi", "kalshi_ticker", "matching_detail"
                     ]
                     available_rejected_cols = [c for c in rejected_cols if c in rejected_df.columns]
-                    st.dataframe(rejected_df[available_rejected_cols].head(300), width="stretch", hide_index=True)
+                    show_rejected = st.checkbox("Mostra a video i pair scartati", value=False)
+                    if show_rejected:
+                        st.dataframe(rejected_df[available_rejected_cols].head(300), width="stretch", hide_index=True)
                     st.download_button(
                         "Scarica CSV pair scartati",
                         rejected_df.to_csv(index=False).encode("utf-8"),
@@ -1137,6 +1237,8 @@ with tab_poly:
         poly_all = get_polymarket_markets(search, poly_download)
     poly_filtered = [m for m in poly_all if quick_filter(search, m)] if search.strip() else poly_all
     st.caption(f"Mercati mostrati: {len(poly_filtered)} su {len(poly_all)} scaricati. Filtro: {search or 'nessuno'}")
+    if len(poly_all) <= 100 and poly_download > 100:
+        st.warning("Polymarket ha restituito al massimo 100 mercati. Prova filtro vuoto, svuota cache, oppure varia la keyword.")
     rows = []
     for m in poly_filtered[:500]:
         outcomes = parse_json_list(m.get("outcomes"))
@@ -1158,8 +1260,12 @@ with tab_kalshi:
     with st.spinner("Carico Kalshi..."):
         kalshi_all_raw = get_kalshi_markets(kalshi_download, search)
     kalshi_all = [m for m in kalshi_all_raw if not is_bad_kalshi_market(m) and not is_strictly_bad_kalshi(m)]
+    kalshi_removed = len(kalshi_all_raw) - len(kalshi_all)
     kalshi_filtered = [m for m in kalshi_all if quick_filter(search, m)] if search.strip() else kalshi_all
-    st.caption(f"Mercati mostrati: {len(kalshi_filtered)} su {len(kalshi_all)} validi; {len(kalshi_all_raw)} scaricati totali. Filtro: {search or 'nessuno'}")
+    st.caption(
+        f"Mercati mostrati: {len(kalshi_filtered)} su {len(kalshi_all)} single-market validi; "
+        f"{kalshi_removed} bundle/multi scartati; {len(kalshi_all_raw)} scaricati totali. Filtro: {search or 'nessuno'}"
+    )
     rows = []
     for m in kalshi_filtered[:500]:
         bid, ask = best_kalshi_prices_from_market(m)
