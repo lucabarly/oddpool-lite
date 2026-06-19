@@ -16,7 +16,7 @@ import streamlit as st
 # Polymarket + bookmaker odds benchmark via The Odds API
 # ============================================================
 
-APP_VERSION = "PolyEdge Scanner v1.1 - Polymarket pagination hotfix + The Odds API benchmark"
+APP_VERSION = "PolyEdge Scanner v1.2 - block outright vs single-game mismatch"
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
@@ -195,14 +195,90 @@ def extract_total_line(question: str) -> Optional[Decimal]:
     return None
 
 
+def is_outright_or_season_market(question: str) -> bool:
+    """
+    Blocca mercati stagionali/outright.
+    Esempio NON confrontabile:
+    - Will Cincinnati Bengals win the 2027 NFL AFC Championship?
+    con:
+    - Bengals @ Dolphins singola partita
+    """
+    q = canonical(question)
+
+    outright_terms = [
+        "championship",
+        "afc championship",
+        "nfc championship",
+        "conference championship",
+        "division",
+        "super bowl",
+        "world cup",
+        "nba finals",
+        "stanley cup",
+        "world series",
+        "tournament",
+        "league winner",
+        "win the 20",
+        "win 20",
+        "regular season",
+        "mvp",
+        "rookie of the year",
+        "cy young",
+        "ballon d or",
+    ]
+
+    return any(term in q for term in outright_terms)
+
+
+def looks_like_single_game_market(question: str) -> bool:
+    """
+    True solo se la domanda Polymarket sembra riferirsi a una singola partita/evento.
+    """
+    q = canonical(question)
+
+    single_game_patterns = [
+        " vs ",
+        " v ",
+        " at ",
+        " @ ",
+        "beat",
+        "defeat",
+        "win on",
+        "win against",
+        "end in a draw",
+        "end in draw",
+        "over",
+        "under",
+        "spread",
+    ]
+
+    if any(p in q for p in single_game_patterns):
+        return True
+
+    # Date ISO o date testuali aiutano a distinguere singola partita.
+    if re.search(r"\b20\d{2}-\d{2}-\d{2}\b", q):
+        return True
+    if re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}\b", q):
+        return True
+
+    return False
+
+
 def poly_market_type(question: str) -> str:
     q = canonical(question)
+
+    if is_outright_or_season_market(question):
+        return "outright"
+
     if "over" in q or "under" in q or "o u" in q or "total" in q:
         return "totals"
+
     if "spread" in q or "handicap" in q:
         return "spreads"
-    if "win" in q or "winner" in q or "beat" in q:
+
+    if ("win" in q or "winner" in q or "beat" in q) and looks_like_single_game_market(question):
         return "h2h"
+
     return "unknown"
 
 
@@ -351,6 +427,7 @@ def is_relevant_poly_market(m: Dict[str, Any], theme: str) -> bool:
         str(m.get("slug") or ""),
     ])
 
+    question = str(m.get("question") or m.get("title") or "")
     q = canonical(text)
 
     if theme.strip():
@@ -358,14 +435,20 @@ def is_relevant_poly_market(m: Dict[str, Any], theme: str) -> bool:
             if term and term not in q:
                 return False
 
-    # Sports-focused first version.
+    # In questa versione usiamo quote bookmaker di singole partite.
+    # Quindi escludiamo championship/outright/stagionali.
+    if is_outright_or_season_market(question):
+        return False
+
+    # Sports-focused single-game first version.
     sport_terms = [
-        " vs ", " win", "winner", "spread", "over", "under", "goals", "runs", "points",
-        "nba", "mlb", "nfl", "soccer", "football", "tennis", "world cup",
+        " vs ", " v ", " @ ", " at ", " beat", " win on", "win against",
+        "spread", "over", "under", "goals", "runs", "points",
+        "nba", "mlb", "nfl", "soccer", "football", "tennis",
         "premier league", "serie a", "la liga", "champions league",
     ]
 
-    return any(t in q for t in sport_terms)
+    return any(t in q for t in sport_terms) and looks_like_single_game_market(question)
 
 
 # ============================================================
@@ -585,16 +668,26 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
         q = p["question"]
         p_type = p["market_type"]
 
-        if p_type == "unknown":
+        if p_type in {"unknown", "outright"}:
+            continue
+
+        if not looks_like_single_game_market(q):
             continue
 
         for (event_id, event, home, away, start), eg in odds_by_event:
             event_text = f"{event} {home} {away}"
             sim = text_similarity(q, event_text)
 
-            # Keep broad enough for debug, strict enough to avoid total noise.
-            if sim < Decimal("0.08"):
+            # Evita confronti assurdi tra mercato stagionale e singola partita.
+            # Ora richiediamo una similarita' minima piu' alta.
+            if sim < Decimal("0.16"):
                 continue
+
+            # Per h2h deve comparire almeno una delle due squadre dell'evento nella domanda Polymarket.
+            if p_type == "h2h":
+                side_check = outcome_side_from_poly_question(q, home, away)
+                if not side_check:
+                    continue
 
             target_market = p_type
             mg = eg[eg["market_key"] == target_market].copy()
@@ -858,7 +951,8 @@ with st.sidebar:
 
     st.divider()
 
-    theme = st.text_input("Filtro Polymarket", value="", placeholder="world cup, bitcoin, nba, team name...")
+    st.caption("Nota: questa versione esclude mercati stagionali/outright Polymarket. Confronta solo singole partite/eventi.")
+    theme = st.text_input("Filtro Polymarket", value="", placeholder="nba, mlb, nfl, team name, over 2.5...")
     poly_download = st.slider("Polymarket da scaricare", 100, 5000, 2500, step=100)
     top_poly = st.slider("Top Polymarket da analizzare", 50, 1500, 400, step=50)
     max_candidates = st.slider("Massimo candidati matching", 20, 1000, 250, step=10)
@@ -1079,6 +1173,9 @@ Il segnale principale è:
 ```text
 edge = fair_probability_bookmaker_no_vig - polymarket_yes_ask
 ```
+
+Importante: questa versione confronta solo mercati Polymarket che sembrano riferiti a singole partite/eventi.
+Mercati stagionali/outright come Championship, Super Bowl, division winner, MVP, World Cup winner vengono esclusi perché non sono confrontabili con quote h2h di una singola partita.
 
 Se l'edge è positivo, Polymarket YES sembra più economico rispetto al benchmark bookmaker.
 
