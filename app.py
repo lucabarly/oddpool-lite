@@ -16,10 +16,41 @@ import streamlit as st
 # Polymarket + bookmaker odds benchmark via The Odds API
 # ============================================================
 
-APP_VERSION = "PolyEdge Scanner v1.3 - strict date/team match for single games"
+APP_VERSION = "PolyEdge Scanner v1.4 - auto multi-sport + totals/BTTS/scorer matching"
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+
+DEFAULT_AUTO_SPORTS = [
+    "soccer_epl",
+    "soccer_italy_serie_a",
+    "soccer_spain_la_liga",
+    "soccer_germany_bundesliga",
+    "soccer_france_ligue_one",
+    "soccer_uefa_champs_league",
+    "soccer_fifa_world_cup",
+    "basketball_nba",
+    "baseball_mlb",
+    "americanfootball_nfl",
+    "icehockey_nhl",
+    "tennis_atp",
+    "tennis_wta",
+]
+
+CORE_MARKETS = ["h2h", "spreads", "totals"]
+
+# Mercati extra: la disponibilita' dipende da sport/bookmaker/piano API.
+# Se una richiesta fallisce, l'app la salta senza bloccare lo scanner.
+EXTRA_MARKETS = [
+    "btts",
+    "draw_no_bet",
+    "player_goal_scorer_anytime",
+    "player_goal_scorer_first",
+    "player_anytime_td",
+    "player_points",
+    "player_rebounds",
+    "player_assists",
+]
 
 st.set_page_config(
     page_title="PolyEdge Scanner",
@@ -366,6 +397,30 @@ def poly_market_type(question: str) -> str:
     if is_outright_or_season_market(question):
         return "outright"
 
+    # Goal / no goal, both teams to score.
+    if (
+        "both teams to score" in q
+        or "btts" in q
+        or "both score" in q
+        or "goal no goal" in q
+        or "no goal" in q
+        or "both teams score" in q
+    ):
+        return "btts"
+
+    # Scorer / player props.
+    if (
+        "score a goal" in q
+        or "scores a goal" in q
+        or "anytime scorer" in q
+        or "first goalscorer" in q
+        or "first goal scorer" in q
+        or "to score" in q
+        or "touchdown" in q
+        or "td scorer" in q
+    ):
+        return "scorer"
+
     if "over" in q or "under" in q or "o u" in q or "total" in q:
         return "totals"
 
@@ -540,6 +595,9 @@ def is_relevant_poly_market(m: Dict[str, Any], theme: str) -> bool:
     sport_terms = [
         " vs ", " v ", " @ ", " at ", " beat", " win on", "win against",
         "spread", "over", "under", "goals", "runs", "points",
+        "both teams to score", "btts", "goal no goal", "no goal",
+        "score a goal", "scores a goal", "anytime scorer", "first goalscorer",
+        "touchdown", "td scorer",
         "nba", "mlb", "nfl", "soccer", "football", "tennis",
         "premier league", "serie a", "la liga", "champions league",
     ]
@@ -607,6 +665,66 @@ def fetch_odds(
 
     except Exception as e:
         return [], {}, str(e)
+
+
+def fetch_odds_multi_sport(
+    api_key: str,
+    sport_keys: List[str],
+    regions: str,
+    core_markets: List[str],
+    extra_markets: List[str],
+    odds_format: str = "decimal",
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    """
+    Scarica quote per piu' sport.
+    I mercati core vengono richiesti insieme.
+    I mercati extra vengono richiesti separatamente, e se falliscono non bloccano lo scanner.
+    """
+    all_events = []
+    quota_rows = []
+    errors = []
+
+    for sport_key in sport_keys:
+        sport_key = str(sport_key).strip()
+        if not sport_key:
+            continue
+
+        # Core markets.
+        if core_markets:
+            events, quota, err = fetch_odds(
+                api_key,
+                sport_key,
+                regions,
+                ",".join(core_markets),
+                odds_format,
+            )
+            if err:
+                errors.append(f"{sport_key} core: {err}")
+            else:
+                all_events.extend(events)
+            if quota:
+                quota_rows.append({"sport": sport_key, **quota})
+
+        # Extra markets: try one by one, skip unsupported.
+        for mkt in extra_markets:
+            events, quota, err = fetch_odds(
+                api_key,
+                sport_key,
+                regions,
+                mkt,
+                odds_format,
+            )
+            if not err and events:
+                all_events.extend(events)
+            elif err:
+                # Keep only concise diagnostics.
+                errors.append(f"{sport_key} {mkt}: {err[:120]}")
+            if quota:
+                quota_rows.append({"sport": sport_key, "market": mkt, **quota})
+
+    # Deduplicate events while preserving bookmaker market content is hard because the same event
+    # can be returned with different markets. We keep all and flatten later; duplicate rows are harmless.
+    return all_events, quota_rows, errors
 
 
 def flatten_odds(events: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -758,6 +876,60 @@ def candidate_poly_questions(poly_markets: List[Dict[str, Any]]) -> pd.DataFrame
     return df
 
 
+def target_outcome_for_market(q_match_text: str, target_market: str, home: str, away: str) -> Tuple[Optional[str], Optional[Decimal], str]:
+    qn = canonical(q_match_text)
+
+    if target_market == "h2h":
+        side = outcome_side_from_poly_question(q_match_text, home, away)
+        if side:
+            return side, None, "team match"
+        return None, None, "missing team side"
+
+    if target_market == "totals":
+        line = extract_total_line(q_match_text)
+        if line is None:
+            return None, None, "missing total line"
+        if "over" in qn:
+            return "Over", line, "total over line match"
+        if "under" in qn:
+            return "Under", line, "total under line match"
+        return None, None, "missing over/under side"
+
+    if target_market == "btts":
+        if "no goal" in qn or "both teams not" in qn or "not both" in qn:
+            return "No", None, "btts no"
+        if "both teams to score" in qn or "btts" in qn or "both score" in qn or "goal no goal" in qn:
+            return "Yes", None, "btts yes"
+        return None, None, "missing btts side"
+
+    if target_market == "scorer":
+        # For player props we do fuzzy player-name matching later.
+        return "PLAYER", None, "player scorer/prop"
+
+    return None, None, "unsupported market"
+
+
+def odds_market_candidates_for_poly_type(p_type: str) -> List[str]:
+    if p_type == "h2h":
+        return ["h2h"]
+    if p_type == "totals":
+        return ["totals"]
+    if p_type == "spreads":
+        return ["spreads"]
+    if p_type == "btts":
+        return ["btts"]
+    if p_type == "scorer":
+        return [
+            "player_goal_scorer_anytime",
+            "player_goal_scorer_first",
+            "player_anytime_td",
+            "player_points",
+            "player_rebounds",
+            "player_assists",
+        ]
+    return []
+
+
 def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_candidates: int) -> pd.DataFrame:
     if poly_df.empty or odds_best_df.empty:
         return pd.DataFrame()
@@ -766,7 +938,6 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
 
     odds_by_event = odds_best_df.groupby(["event_id", "event", "home_team", "away_team", "event_date", "start"], dropna=False)
 
-    count = 0
     for _, p in poly_df.head(max_candidates).iterrows():
         q = p["question"]
         q_match_text = p.get("match_text") or q
@@ -776,131 +947,115 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
         if p_type in {"unknown", "outright"}:
             continue
 
-        if not looks_like_single_game_market(q):
+        if not looks_like_single_game_market(q_match_text):
+            continue
+
+        possible_markets = odds_market_candidates_for_poly_type(p_type)
+        if not possible_markets:
             continue
 
         for (event_id, event, home, away, event_date, start), eg in odds_by_event:
             event_text = f"{event} {home} {away}"
             sim = text_similarity(q_match_text, event_text)
 
-            # Regola fondamentale: se Polymarket contiene una data ISO, deve combaciare con la data evento bookmaker.
+            # Date must match if Polymarket contains ISO date.
             if poly_dates and event_date not in poly_dates:
                 continue
 
-            # Evita confronti assurdi tra mercato stagionale e singola partita.
-            # Ora richiediamo una similarita' minima piu' alta.
             if sim < Decimal("0.16"):
                 continue
 
-            # Per h2h deve comparire almeno una delle due squadre dell'evento nella domanda Polymarket.
+            # For h2h require one of the two teams.
             if p_type == "h2h":
                 side_check = outcome_side_from_poly_question(q_match_text, home, away)
                 if not side_check:
                     continue
 
-            target_market = p_type
-            mg = eg[eg["market_key"] == target_market].copy()
+            for target_market in possible_markets:
+                mg = eg[eg["market_key"] == target_market].copy()
+                if mg.empty:
+                    continue
 
-            if mg.empty:
-                continue
+                target_outcome, target_point, reason = target_outcome_for_market(q_match_text, p_type, home, away)
+                if target_outcome is None:
+                    continue
 
-            target_outcome = None
-            target_point = None
-            confidence = "Bassa"
-            reason = ""
+                if p_type in {"h2h", "totals", "btts"}:
+                    candidates = mg[mg["outcome"].apply(lambda x: canonical(x) == canonical(target_outcome))].copy()
 
-            if target_market == "h2h":
-                side = outcome_side_from_poly_question(q_match_text, home, away)
-                if side:
-                    target_outcome = side
-                    confidence = "Media" if sim >= Decimal("0.12") else "Bassa"
-                    reason = "team match"
+                    if target_point is not None:
+                        candidates = candidates[candidates["point"].apply(lambda x: dec(x, "-999") == target_point)]
+
+                    if candidates.empty:
+                        continue
+
+                elif p_type == "scorer":
+                    cand_rows = []
+                    for _, rr in mg.iterrows():
+                        out_text = str(rr.get("outcome") or "")
+                        player_sim = text_similarity(q_match_text, out_text)
+                        if player_sim >= Decimal("0.25"):
+                            rrd = rr.to_dict()
+                            rrd["_player_sim"] = float(player_sim)
+                            cand_rows.append(rrd)
+
+                    if not cand_rows:
+                        continue
+
+                    candidates = pd.DataFrame(cand_rows).sort_values("_player_sim", ascending=False)
+
                 else:
                     continue
 
-            elif target_market == "totals":
-                line = extract_total_line(q_match_text)
-                qn = canonical(q_match_text)
-                if line is None:
-                    continue
-
-                if "over" in qn:
-                    target_outcome = "Over"
-                elif "under" in qn:
-                    target_outcome = "Under"
+                # Compute no-vig fair probability using all outcomes for same event/market/point.
+                if target_point is None:
+                    group_for_probs = mg
                 else:
-                    continue
+                    group_for_probs = mg[mg["point"].apply(lambda x: dec(x, "-999") == target_point)]
 
-                target_point = line
-                confidence = "Media" if sim >= Decimal("0.10") else "Bassa"
-                reason = "total line match"
+                no_vig = no_vig_probabilities(group_for_probs)
 
-            elif target_market == "spreads":
-                # V1: keep only debug candidates, because spread wording is more dangerous.
-                continue
+                best = candidates.sort_values("best_odds", ascending=False).iloc[0]
+                key = f"{best['outcome']}|{best['point']}"
+                fair_prob = no_vig.get(key)
 
-            if target_outcome is None:
-                continue
+                if fair_prob is None:
+                    fair_prob = Decimal(str(best["avg_market_implied_probability"]))
 
-            # Find exact outcome in bookmaker best odds.
-            candidates = mg[mg["outcome"].apply(lambda x: canonical(x) == canonical(target_outcome))].copy()
+                confidence = "Media"
+                if int(best["books_compared"]) >= 3 and sim >= Decimal("0.18"):
+                    confidence = "Alta"
 
-            if target_point is not None:
-                candidates = candidates[candidates["point"].apply(lambda x: dec(x, "-999") == target_point)]
+                # For extra markets, be stricter.
+                if p_type in {"btts", "scorer"} and int(best["books_compared"]) < 2:
+                    confidence = "Media"
 
-            if candidates.empty:
-                continue
-
-            # Compute no-vig fair probability using all outcomes for same event/market/point.
-            point_filter = "" if target_point is None else str(float(target_point)).rstrip("0").rstrip(".")
-            if target_point is None:
-                group_for_probs = mg
-            else:
-                group_for_probs = mg[mg["point"].apply(lambda x: dec(x, "-999") == target_point)]
-
-            no_vig = no_vig_probabilities(group_for_probs)
-
-            best = candidates.sort_values("best_odds", ascending=False).iloc[0]
-            key = f"{best['outcome']}|{best['point']}"
-            fair_prob = no_vig.get(key)
-
-            if fair_prob is None:
-                # fallback: average implied, less good
-                fair_prob = Decimal(str(best["avg_market_implied_probability"]))
-
-            # Upgrade confidence for exact team/event plus enough books.
-            if confidence == "Media" and int(best["books_compared"]) >= 3 and sim >= Decimal("0.16"):
-                confidence = "Alta"
-
-            rows.append({
-                "confidence": confidence,
-                "reason": reason,
-                "similarity": float(sim),
-                "polymarket_question": q,
-                "poly_market_type": p_type,
-                "poly_token_yes": p["token_yes"],
-                "poly_volume": p["volume"],
-                "poly_liquidity": p["liquidity"],
-                "poly_link": market_link_poly(p["raw"]),
-                "odds_event": event,
-                "event_date": event_date,
-                "poly_dates": ",".join(sorted(poly_dates)),
-                "event_start": start,
-                "odds_market": target_market,
-                "odds_outcome": best["outcome"],
-                "odds_point": best["point"],
-                "best_bookmaker": best["best_bookmaker"],
-                "best_odds": best["best_odds"],
-                "books_compared": best["books_compared"],
-                "fair_probability": float(fair_prob),
-                "event_id": event_id,
-            })
-
-            count += 1
+                rows.append({
+                    "confidence": confidence,
+                    "reason": reason,
+                    "similarity": float(sim),
+                    "polymarket_question": q,
+                    "poly_market_type": p_type,
+                    "poly_token_yes": p["token_yes"],
+                    "poly_volume": p["volume"],
+                    "poly_liquidity": p["liquidity"],
+                    "poly_link": market_link_poly(p["raw"]),
+                    "odds_event": event,
+                    "event_date": event_date,
+                    "poly_dates": ",".join(sorted(poly_dates)),
+                    "event_start": start,
+                    "odds_market": target_market,
+                    "odds_outcome": best["outcome"],
+                    "odds_point": best["point"],
+                    "best_bookmaker": best["best_bookmaker"],
+                    "best_odds": best["best_odds"],
+                    "books_compared": best["books_compared"],
+                    "fair_probability": float(fair_prob),
+                    "event_id": event_id,
+                })
 
     out = pd.DataFrame(rows)
     if not out.empty:
-        out = out.sort_values(["confidence", "similarity", "poly_volume"], ascending=[True, False, False])
         conf_order = {"Alta": 0, "Media": 1, "Bassa": 2}
         out["_conf_order"] = out["confidence"].map(conf_order).fillna(9)
         out = out.sort_values(["_conf_order", "similarity", "poly_volume"], ascending=[True, False, False]).drop(columns=["_conf_order"])
@@ -1033,32 +1188,50 @@ with st.sidebar:
 
     st.divider()
 
-    sport_default_options = [
-        "soccer_epl",
-        "soccer_italy_serie_a",
-        "soccer_spain_la_liga",
-        "soccer_uefa_champs_league",
-        "basketball_nba",
-        "baseball_mlb",
-        "americanfootball_nfl",
-        "tennis_atp",
-        "tennis_wta",
-    ]
+    auto_multi_sport = st.checkbox("Auto-scan multi-sport", value=True)
 
     sports, sports_err = fetch_sports(odds_api_key) if odds_api_key else ([], "")
 
+    available_sport_keys = []
     if sports:
         active = [s for s in sports if s.get("active", True)]
-        labels = [f"{s.get('title')} ({s.get('key')})" for s in active]
-        selected_label = st.selectbox("Sport The Odds API", labels, index=0)
-        selected_sport = active[labels.index(selected_label)].get("key")
+        available_sport_keys = [str(s.get("key")) for s in active if s.get("key")]
     else:
-        selected_sport = st.selectbox("Sport The Odds API", sport_default_options, index=0)
+        available_sport_keys = DEFAULT_AUTO_SPORTS
         if sports_err:
             st.caption(f"Sports API: {sports_err}")
 
+    default_auto = [s for s in DEFAULT_AUTO_SPORTS if s in available_sport_keys]
+    if not default_auto:
+        default_auto = available_sport_keys[:8]
+
+    if auto_multi_sport:
+        selected_sports = st.multiselect(
+            "Sport da scansionare automaticamente",
+            available_sport_keys,
+            default=default_auto[:8],
+            help="Puoi lasciarlo automatico. Meno sport = piu' veloce; piu' sport = piu' copertura."
+        )
+    else:
+        selected_sport = st.selectbox("Sport The Odds API", available_sport_keys, index=0)
+        selected_sports = [selected_sport]
+
     regions = st.multiselect("Bookmaker regions", ["us", "uk", "eu", "au"], default=["us", "uk", "eu"])
-    markets = st.multiselect("Mercati bookmaker", ["h2h", "totals", "spreads"], default=["h2h", "totals"])
+    core_markets_selected = st.multiselect(
+        "Mercati core bookmaker",
+        CORE_MARKETS,
+        default=["h2h", "totals"],
+        help="h2h = risultato, totals = over/under, spreads = handicap/spread"
+    )
+
+    use_extra_markets = st.checkbox("Prova mercati extra: goal/no goal, scorer, player props", value=True)
+    extra_markets_selected = st.multiselect(
+        "Mercati extra",
+        EXTRA_MARKETS,
+        default=["btts", "player_goal_scorer_anytime", "player_goal_scorer_first"],
+        disabled=not use_extra_markets,
+        help="Disponibilita' variabile per sport/bookmaker/piano API. Se non supportati, vengono saltati."
+    ) if use_extra_markets else []
 
     st.divider()
 
@@ -1099,25 +1272,31 @@ with tab_scan:
 
     if not odds_api_key:
         st.error("Inserisci una The Odds API key nella sidebar o nei secrets Streamlit come ODDS_API_KEY.")
-    elif not regions or not markets:
-        st.error("Seleziona almeno una regione e almeno un mercato.")
+    elif not regions or not core_markets_selected:
+        st.error("Seleziona almeno una regione e almeno un mercato core.")
+    elif not selected_sports:
+        st.error("Seleziona almeno uno sport.")
     else:
         if st.button("Avvia scanner", type="primary"):
             with st.spinner("Scarico dati..."):
                 poly_markets, poly_err = fetch_polymarket_markets(poly_download, theme)
-                odds_events, quota, odds_err = fetch_odds(
+                odds_events, quota_rows, odds_errors = fetch_odds_multi_sport(
                     odds_api_key,
-                    selected_sport,
+                    selected_sports,
                     ",".join(regions),
-                    ",".join(markets),
+                    core_markets_selected,
+                    extra_markets_selected,
                     "decimal",
                 )
+                quota = quota_rows[-1] if quota_rows else {}
+                odds_err = ""
 
             if poly_err:
                 st.warning(f"Polymarket warning: {poly_err}")
-            if odds_err:
-                st.error(f"The Odds API error: {odds_err}")
-                st.stop()
+            if odds_errors:
+                with st.expander("The Odds API: mercati/sport saltati"):
+                    st.write("Alcuni mercati extra o sport possono non essere disponibili con il piano/API corrente.")
+                    st.write(odds_errors[:50])
 
             poly_filtered = [m for m in poly_markets if is_relevant_poly_market(m, theme)]
             poly_df = candidate_poly_questions(poly_filtered).head(top_poly)
@@ -1126,11 +1305,15 @@ with tab_scan:
 
             st.info(
                 f"Dataset: {len(poly_df)} Polymarket analizzati su {len(poly_markets)} scaricati; "
-                f"{len(odds_events)} eventi odds; {len(odds_df)} quote bookmaker."
+                f"{len(odds_events)} eventi odds da {len(selected_sports)} sport; {len(odds_df)} quote bookmaker."
             )
 
-            if quota:
-                st.caption(f"Odds API quota: remaining={quota.get('requests_remaining')} used={quota.get('requests_used')} last={quota.get('requests_last')}")
+            if quota_rows:
+                last_quota = quota_rows[-1]
+                st.caption(
+                    f"Odds API quota ultima richiesta: remaining={last_quota.get('requests_remaining')} "
+                    f"used={last_quota.get('requests_used')} last={last_quota.get('requests_last')}"
+                )
 
             if poly_df.empty:
                 st.warning("Nessun mercato Polymarket rilevante trovato. Prova un filtro diverso o vuoto.")
@@ -1145,7 +1328,7 @@ with tab_scan:
                 else:
                     st.markdown("### Candidati matching")
                     cand_cols = [
-                        "confidence", "similarity", "polymarket_question", "odds_event", "poly_dates", "event_date", "event_start",
+                        "confidence", "similarity", "poly_market_type", "polymarket_question", "odds_event", "poly_dates", "event_date", "event_start",
                         "odds_market", "odds_outcome", "odds_point", "best_bookmaker", "best_odds",
                         "books_compared", "fair_probability", "poly_link"
                     ]
@@ -1158,10 +1341,10 @@ with tab_scan:
                         st.info("Nessun candidato valutato.")
                     else:
                         main_cols = [
-                            "suggested_action", "confidence", "edge_vs_poly_ask_%", "estimated_ev_$",
+                            "suggested_action", "confidence", "poly_market_type", "edge_vs_poly_ask_%", "estimated_ev_$",
                             "capital", "poly_ask", "poly_bid", "fair_probability_%",
                             "polymarket_question", "odds_event", "poly_dates", "event_date", "event_start",
-                            "odds_outcome", "best_bookmaker", "best_odds",
+                            "odds_market", "odds_outcome", "best_bookmaker", "best_odds",
                             "books_compared", "poly_link", "book_status"
                         ]
 
@@ -1214,17 +1397,21 @@ with tab_odds:
     if not odds_api_key:
         st.error("Inserisci The Odds API key.")
     elif st.button("Carica bookmaker odds", key="load_odds"):
-        odds_events, quota, odds_err = fetch_odds(
+        odds_events, quota_rows, odds_errors = fetch_odds_multi_sport(
             odds_api_key,
-            selected_sport,
+            selected_sports,
             ",".join(regions),
-            ",".join(markets),
+            core_markets_selected,
+            extra_markets_selected,
             "decimal",
         )
+        quota = quota_rows[-1] if quota_rows else {}
+        odds_err = ""
 
-        if odds_err:
-            st.error(odds_err)
-        else:
+        if odds_errors:
+            with st.expander("The Odds API: mercati/sport saltati"):
+                st.write(odds_errors[:50])
+        if True:
             odds_df = flatten_odds(odds_events)
             odds_best = best_odds_for_event(odds_df)
 
@@ -1233,7 +1420,7 @@ with tab_odds:
                 st.caption(f"Quota: remaining={quota.get('requests_remaining')} used={quota.get('requests_used')} last={quota.get('requests_last')}")
 
             if not odds_best.empty:
-                show_cols = ["event", "start", "market_key", "outcome", "point", "best_bookmaker", "best_odds", "books_compared"]
+                show_cols = ["event", "event_date", "start", "market_key", "outcome", "point", "best_bookmaker", "best_odds", "books_compared"]
                 st.dataframe(odds_best[show_cols].head(1000), width="stretch", hide_index=True)
 
 
@@ -1278,6 +1465,8 @@ Questa app non cerca più Kalshi. Usa:
 Polymarket = mercato tradabile
 The Odds API = benchmark quote bookmaker
 ```
+
+Da v1.4 non devi scegliere uno sport singolo: puoi usare Auto-scan multi-sport. L'app prova più sport e più mercati, inclusi risultato partita, over/under, spread, goal/no goal e scorer/player props quando disponibili.
 
 Il segnale principale è:
 
