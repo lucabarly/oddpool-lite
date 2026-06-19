@@ -17,7 +17,7 @@ KALSHI_BASE_ALT = "https://external-api.kalshi.com/trade-api/v2"
 
 st.set_page_config(page_title="Oddpool Lite Scanner", layout="wide")
 st.title("Oddpool Lite - Scanner automatico opportunita'")
-st.caption("Versione aggiornata: profitto stimato YES+NO + anti-falsi positivi + debug matching")
+st.caption("Versione aggiornata: matching strutturato strict + profitto YES+NO")
 st.caption(
     "Scanner gratuito Polymarket/Kalshi: trova mercati simili, legge top-of-book e calcola edge teorico. "
     "Non e' consulenza finanziaria e non esegue trade automatici."
@@ -249,6 +249,197 @@ def kalshi_matching_text(m: Dict[str, Any]) -> str:
         m.get("category"), m.get("ticker"), m.get("event_ticker"), m.get("series_ticker"),
     ]
     return " ".join(str(x or "") for x in fields)
+
+
+TEAM_ALIASES = {
+    "usa": "united states",
+    "us": "united states",
+    "united states": "united states",
+    "korea republic": "south korea",
+    "republic of korea": "south korea",
+    "south korea": "south korea",
+    "turkiye": "turkey",
+    "turkey": "turkey",
+    "ivory coast": "cote d ivoire",
+    "cote d ivoire": "cote d ivoire",
+    "dr congo": "congo dr",
+    "congo dr": "congo dr",
+    "bosnia herzegovina": "bosnia and herzegovina",
+    "bosnia and herzegovina": "bosnia and herzegovina",
+}
+
+COMMON_TEAMS = {
+    "argentina", "australia", "austria", "belgium", "brazil", "canada", "chile",
+    "colombia", "croatia", "ecuador", "egypt", "england", "france", "germany",
+    "ghana", "haiti", "iran", "iraq", "italy", "japan", "mexico", "morocco",
+    "netherlands", "norway", "paraguay", "portugal", "qatar", "scotland",
+    "senegal", "spain", "sweden", "switzerland", "tunisia", "turkey",
+    "united states", "uruguay", "south korea", "new zealand", "cape verde",
+    "algeria", "jordan", "panama", "curacao", "czechia", "south africa",
+    "congo dr", "cote d ivoire", "uzbekistan",
+    "atlanta", "baltimore", "chicago", "detroit", "houston", "indiana",
+    "los angeles", "miami", "milwaukee", "new york", "philadelphia",
+    "san francisco", "seattle", "tampa bay", "texas", "washington",
+}
+
+SPORT_WORDS = {
+    "vs", "win", "wins", "winner", "draw", "tie", "spread", "over", "under",
+    "goals", "runs", "points", "world cup", "fifa", "mlb", "nba", "wnba",
+    "tennis", "soccer", "football", "baseball", "basketball",
+}
+
+CRYPTO_WORDS = {"bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto"}
+MACRO_WORDS = {"fed", "federal reserve", "interest rates", "cpi", "inflation", "rate", "rates"}
+
+
+def canonical_text_for_rules(s: str) -> str:
+    s = normalize_text(s)
+    for k, v in TEAM_ALIASES.items():
+        s = s.replace(k, v)
+    return s
+
+
+def extract_dates(s: str) -> set:
+    s = s.lower()
+    dates = set(re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", s))
+    dates.update(re.findall(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:,\s*20\d{2})?\b", s))
+    dates.update(re.findall(r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:,\s*20\d{2})?\b", s))
+    return dates
+
+
+def extract_teams(s: str) -> set:
+    s = canonical_text_for_rules(s)
+    found = set()
+    for team in COMMON_TEAMS:
+        if re.search(r"\b" + re.escape(team) + r"\b", s):
+            found.add(team)
+    return found
+
+
+def has_any_phrase(s: str, phrases: set) -> bool:
+    s = canonical_text_for_rules(s)
+    return any(p in s for p in phrases)
+
+
+def is_over_under_market(s: str) -> bool:
+    s = canonical_text_for_rules(s)
+    return ("over" in s or "under" in s or "o u" in s) and bool(important_numbers(s))
+
+
+def is_draw_market(s: str) -> bool:
+    s = canonical_text_for_rules(s)
+    return bool(re.search(r"\b(draw|tie)\b", s))
+
+
+def market_family_from_text(s: str) -> str:
+    stxt = canonical_text_for_rules(s)
+    if has_any_phrase(stxt, CRYPTO_WORDS):
+        return "crypto"
+    if has_any_phrase(stxt, MACRO_WORDS):
+        return "macro"
+    if has_any_phrase(stxt, SPORT_WORDS) or bool(extract_teams(stxt)):
+        return "sport"
+    return "other"
+
+
+def is_strictly_bad_kalshi(m: Dict[str, Any]) -> bool:
+    ticker = str(m.get("ticker") or "").upper()
+    series = str(m.get("series_ticker") or "").upper()
+    event = str(m.get("event_ticker") or "").upper()
+    txt = kalshi_display_question(m).lower()
+
+    joined = " ".join([ticker, series, event])
+    hard_bad = ["MULTIGAME", "CROSSCATEGORY", "CROSS_CATEGORY", "PARLAY", "COMBO", "KXMVECROSSCATEGORY", "KXMVESPORTSMULTIGAME"]
+    if any(x in joined for x in hard_bad):
+        return True
+
+    if txt.count(",") >= 2:
+        return True
+
+    if len(re.findall(r"\b(yes|no)\b", txt)) >= 4:
+        return True
+
+    if len(txt.split()) > 32:
+        return True
+
+    return False
+
+
+def structured_pair_ok(pm: Dict[str, Any], km: Dict[str, Any], mode: str) -> Tuple[bool, str]:
+    if is_strictly_bad_kalshi(km) or is_bad_kalshi_market(km):
+        return False, "Kalshi bundle/multigame/crosscategory"
+
+    ptxt = text_of_market(pm)
+    ktxt = kalshi_matching_text(km)
+    pnorm = canonical_text_for_rules(ptxt)
+    knorm = canonical_text_for_rules(ktxt)
+
+    p_family = market_family_from_text(pnorm)
+    k_family = market_family_from_text(knorm)
+
+    if mode != "Auto strict":
+        wanted = {
+            "Sport strict": "sport",
+            "Crypto strict": "crypto",
+            "Macro/Fed strict": "macro",
+        }.get(mode)
+        if wanted and (p_family != wanted or k_family != wanted):
+            return False, f"famiglia diversa da {wanted}"
+
+    if p_family != k_family:
+        return False, f"famiglia diversa ({p_family} vs {k_family})"
+
+    pnums = important_numbers(pnorm)
+    knums = important_numbers(knorm)
+    if pnums and knums and not (pnums & knums):
+        return False, "soglia/numero diverso"
+
+    pdates = extract_dates(pnorm)
+    kdates = extract_dates(knorm)
+    if pdates and kdates and not (pdates & kdates):
+        return False, "data diversa"
+
+    pteams = extract_teams(pnorm)
+    kteams = extract_teams(knorm)
+
+    if p_family == "sport":
+        if pteams or kteams:
+            common_teams = pteams & kteams
+            if not common_teams:
+                return False, "squadra/player non coincidente"
+
+        if is_over_under_market(pnorm) or is_over_under_market(knorm):
+            if not (is_over_under_market(pnorm) and is_over_under_market(knorm)):
+                return False, "tipo mercato diverso: over/under"
+            if pnums and knums and not (pnums & knums):
+                return False, "linea over/under diversa"
+
+        if is_draw_market(pnorm) or is_draw_market(knorm):
+            if not (is_draw_market(pnorm) and is_draw_market(knorm)):
+                return False, "draw/tie non equivalente"
+
+    if p_family == "crypto":
+        assets = ["bitcoin", "ethereum", "solana"]
+        common_assets = [a for a in assets if a in pnorm and a in knorm]
+        if not common_assets:
+            return False, "asset crypto diverso"
+        if pnums and knums and not (pnums & knums):
+            return False, "soglia prezzo crypto diversa"
+
+    if p_family == "macro":
+        pk = keywords(pnorm)
+        kk = keywords(knorm)
+        overlap = pk & kk
+        if len(overlap) < 2:
+            return False, "macro keywords insufficienti"
+
+    pk = keywords(pnorm)
+    kk = keywords(knorm)
+    strong_overlap = (pk & kk) - STOPWORDS
+    if len(strong_overlap) < 2 and not (pteams & kteams):
+        return False, "keyword forti insufficienti"
+
+    return True, "ok strutturato"
 
 
 def no_ask_from_yes_bid(yes_bid: Optional[Decimal]) -> Optional[Decimal]:
@@ -544,6 +735,8 @@ def candidate_pairs(poly_markets: List[Dict[str, Any]], kalshi_markets: List[Dic
 
     k_index: Dict[str, List[int]] = {}
     for i, km in enumerate(kalshi_markets):
+        if is_bad_kalshi_market(km) or is_strictly_bad_kalshi(km):
+            continue
         for kw in list(keywords(kalshi_matching_text(km)))[:30]:
             k_index.setdefault(kw, []).append(i)
 
@@ -590,6 +783,7 @@ def scan_opportunities(
     min_edge: Decimal,
     read_orderbooks: bool,
     capital_per_trade: Decimal,
+    matching_mode: str,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Ritorna due tabelle:
@@ -609,6 +803,9 @@ def scan_opportunities(
     for n, pair in enumerate(pairs, start=1):
         pm = pair["poly"]
         km = pair["kalshi"]
+
+        structured_ok, structured_reason = structured_pair_ok(pm, km, matching_mode)
+
         token = polymarket_yes_token(pm)
         ticker = km.get("ticker")
 
@@ -696,6 +893,10 @@ def scan_opportunities(
             "confidence": confidence(pair["similarity"], pair["details"]),
             "similarity": round(pair["similarity"], 3),
             "passes_similarity": pair.get("passes_similarity", False),
+            "structured_ok": structured_ok,
+            "structured_reason": structured_reason,
+            "market_family_poly": market_family_from_text(text_of_market(pm)),
+            "market_family_kalshi": market_family_from_text(kalshi_matching_text(km)),
             "polymarket": pm.get("question") or pm.get("title") or pm.get("eventTitle"),
             "kalshi": kalshi_display_question(km),
             "kalshi_title_raw": km.get("title"),
@@ -734,14 +935,18 @@ def scan_opportunities(
             best_yn_profit is not None
             and best_yn_profit >= min_edge
             and pair["similarity"] >= min_similarity
+            and structured_ok
             and confidence(pair["similarity"], pair["details"]) != "Bassa"
             and not is_bad_kalshi_market(km)
+            and not is_strictly_bad_kalshi(km)
             and valid_price_pair(p_bid, p_ask)
             and valid_price_pair(k_bid, k_ask)
         )
 
         if not is_real_candidate and not reject_reason:
-            if is_bad_kalshi_market(km):
+            if not structured_ok:
+                base_row["motivo_scarto"] = structured_reason
+            elif is_bad_kalshi_market(km) or is_strictly_bad_kalshi(km):
                 base_row["motivo_scarto"] = "Kalshi multi-game/cross-category"
             elif not valid_price_pair(k_bid, k_ask):
                 base_row["motivo_scarto"] = "prezzi Kalshi non validi o zero"
@@ -777,13 +982,14 @@ def scan_opportunities(
 # -----------------------------
 with st.sidebar:
     st.header("Impostazioni scanner")
-    search = st.text_input("Filtro tema", value="", placeholder="bitcoin, btc, fed, trump, inflation...")
+    search = st.text_input("Filtro tema", value="", placeholder="bitcoin, btc, fed, world cup, mexico...")
+    matching_mode = st.selectbox("Modalita matching", ["Sport strict", "Crypto strict", "Macro/Fed strict", "Auto strict"], index=0)
     poly_download = st.slider("Mercati Polymarket da scaricare", 500, 8000, 3000, step=500)
     kalshi_download = st.slider("Mercati Kalshi da scaricare", 100, 3000, 1000, step=100)
     top_poly = st.slider("Top Polymarket usati nello scanner", 20, 1500, 500, step=10)
     top_kalshi = st.slider("Top Kalshi usati nello scanner", 20, 3000, 1000, step=20)
     max_pairs = st.slider("Pair candidati da analizzare", 10, 1000, 300, step=10)
-    min_similarity = st.slider("Similarita\' minima matching", 0.05, 0.85, 0.15, step=0.01)
+    min_similarity = st.slider("Similarita\' minima matching", 0.05, 0.95, 0.35, step=0.01)
     min_edge_pct = st.number_input("Mostra solo edge netto >= %", min_value=-20.0, max_value=20.0, value=0.0, step=0.1)
     capital_per_trade = Decimal(str(st.number_input("Capitale per trade ($)", min_value=1.0, max_value=100000.0, value=100.0, step=50.0)))
     buffer_bps = Decimal(str(st.number_input("Buffer fee/slippage, bps", min_value=0, max_value=1500, value=0, step=10)))
@@ -813,6 +1019,7 @@ with tab_scan:
         "Lo scanner prova a trovare mercati simili tra le due piattaforme e calcola un edge teorico. "
         "Le opportunita' con confidence Media/Bassa vanno verificate manualmente: wording e regole di settlement possono essere diversi."
     )
+    st.info("Nuova logica: non confronta piu' tutto contro tutto. Filtra per famiglia di mercato, squadre/date/soglie e scarta bundle Kalshi.")
 
     if st.button("Avvia scanner", type="primary"):
         with st.spinner("Scarico mercati Polymarket e Kalshi..."):
@@ -830,7 +1037,7 @@ with tab_scan:
             st.warning("Pochi dati trovati. Prova filtro vuoto oppure una keyword piu' ampia: crypto, election, fed, inflation.")
         else:
             min_edge = Decimal(str(min_edge_pct)) / Decimal("100")
-            df, debug_df = scan_opportunities(poly_sorted, kalshi_sorted, min_similarity, max_pairs, buffer_bps, min_edge, read_orderbooks, capital_per_trade)
+            df, debug_df = scan_opportunities(poly_sorted, kalshi_sorted, min_similarity, max_pairs, buffer_bps, min_edge, read_orderbooks, capital_per_trade, matching_mode)
 
             view_cols = [
                 "edge_netto_%", "roi_netto_%", "profitto_stimato_$", "capitale_trade", "trade", "confidence", "similarity",
@@ -841,6 +1048,7 @@ with tab_scan:
 
             debug_cols = [
                 "edge_netto_%", "roi_netto_%", "profitto_stimato_$", "confidence", "similarity", "motivo_scarto",
+                "structured_reason", "market_family_poly", "market_family_kalshi",
                 "polymarket", "kalshi", "poly_bid", "poly_ask", "poly_no_ask_stimato",
                 "kalshi_bid", "kalshi_ask", "kalshi_no_ask_stimato", "costo_per_contratto",
                 "profitto_per_contratto", "kalshi_ticker", "status", "matching_detail"
@@ -906,7 +1114,7 @@ with tab_kalshi:
     st.subheader("Mercati Kalshi")
     with st.spinner("Carico Kalshi..."):
         kalshi_all_raw = get_kalshi_markets(kalshi_download, search)
-    kalshi_all = [m for m in kalshi_all_raw if not is_bad_kalshi_market(m)]
+    kalshi_all = [m for m in kalshi_all_raw if not is_bad_kalshi_market(m) and not is_strictly_bad_kalshi(m)]
     kalshi_filtered = [m for m in kalshi_all if quick_filter(search, m)] if search.strip() else kalshi_all
     st.caption(f"Mercati mostrati: {len(kalshi_filtered)} su {len(kalshi_all)} validi; {len(kalshi_all_raw)} scaricati totali. Filtro: {search or 'nessuno'}")
     rows = []
