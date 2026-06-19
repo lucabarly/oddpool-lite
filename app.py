@@ -17,7 +17,7 @@ KALSHI_BASE_ALT = "https://external-api.kalshi.com/trade-api/v2"
 
 st.set_page_config(page_title="Oddpool Lite Scanner", layout="wide")
 st.title("Oddpool Lite - Scanner automatico opportunita'")
-st.caption("Versione aggiornata: hotfix kalshi_removed + Kalshi single-market only")
+st.caption("Versione aggiornata: progress percentuale + modalita veloce + Kalshi single-market only")
 st.caption(
     "Scanner gratuito Polymarket/Kalshi: trova mercati simili, legge top-of-book e calcola edge teorico. "
     "Non e' consulenza finanziaria e non esegue trade automatici."
@@ -885,6 +885,7 @@ def scan_opportunities(
     read_orderbooks: bool,
     capital_per_trade: Decimal,
     matching_mode: str,
+    fast_mode: bool,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Ritorna tre tabelle:
@@ -900,7 +901,9 @@ def scan_opportunities(
     if not pairs:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    progress = st.progress(0, text="Analisi pair candidati...")
+    progress = st.progress(0, text="Analisi pair candidati... 0%")
+    status_box = st.empty()
+    start_ts = time.time()
     total = max(1, len(pairs))
 
     for n, pair in enumerate(pairs, start=1):
@@ -916,6 +919,62 @@ def scan_opportunities(
         k_bid = k_ask = None
         status = "ok"
         reject_reason = ""
+
+        # Velocita: se il pair non e' strutturalmente compatibile, non leggiamo orderbook.
+        # Questo evita centinaia di chiamate API inutili.
+        if fast_mode and not structured_ok:
+            base_row = {
+                "edge_netto": None,
+                "edge_netto_%": "",
+                "trade": "",
+                "confidence": confidence(pair["similarity"], pair["details"]),
+                "similarity": round(pair["similarity"], 3),
+                "passes_similarity": pair.get("passes_similarity", False),
+                "structured_ok": structured_ok,
+                "structured_reason": structured_reason,
+                "market_family_poly": market_family_from_text(text_of_market(pm)),
+                "market_family_kalshi": market_family_from_text(kalshi_matching_text(km)),
+                "motivo_scarto": structured_reason,
+                "polymarket": pm.get("question") or pm.get("title") or pm.get("eventTitle"),
+                "kalshi": kalshi_display_question(km),
+                "kalshi_title_raw": km.get("title"),
+                "kalshi_subtitle_raw": km.get("subtitle"),
+                "poly_bid": "",
+                "poly_ask": "",
+                "poly_no_ask_stimato": "",
+                "kalshi_bid": "",
+                "kalshi_ask": "",
+                "kalshi_no_ask_stimato": "",
+                "costo_per_contratto": "",
+                "profitto_per_contratto": "",
+                "roi_netto_%": "",
+                "capitale_trade": fmt_money(capital_per_trade),
+                "contratti_stimati": "",
+                "profitto_stimato_$": "",
+                "poly_liquidity": to_float(pm.get("liquidity") or pm.get("liquidityNum")),
+                "poly_volume24h": to_float(pm.get("volume24hr") or pm.get("volume24hrClob")),
+                "kalshi_volume": to_float(km.get("volume")),
+                "kalshi_liquidity": to_float(km.get("liquidity")),
+                "kalshi_ticker": ticker,
+                "poly_token_yes": token,
+                "poly_link": market_link_poly(pm),
+                "kalshi_link": market_link_kalshi(km),
+                "matching_detail": json.dumps(pair["details"]),
+                "status": "scartato prima degli orderbook",
+            }
+            rejected_rows.append(base_row)
+
+            pct = n / total
+            elapsed = time.time() - start_ts
+            eta = (elapsed / n) * (total - n) if n > 0 else 0
+            progress.progress(
+                pct,
+                text=f"Analisi pair {n}/{total} - {pct*100:.1f}% - ETA {eta:.0f}s"
+            )
+            status_box.caption(
+                f"Compatibili trovati: {len(debug_rows)} | Opportunita: {len(opportunity_rows)} | Scartati: {len(rejected_rows)}"
+            )
+            continue
 
         try:
             if token and read_orderbooks:
@@ -1066,10 +1125,20 @@ def scan_opportunities(
         if is_real_candidate:
             opportunity_rows.append(base_row)
 
-        progress.progress(n / total, text=f"Analisi pair {n}/{total}")
-        time.sleep(0.01)
+        pct = n / total
+        elapsed = time.time() - start_ts
+        eta = (elapsed / n) * (total - n) if n > 0 else 0
+        progress.progress(
+            pct,
+            text=f"Analisi pair {n}/{total} - {pct*100:.1f}% - ETA {eta:.0f}s"
+        )
+        status_box.caption(
+            f"Compatibili trovati: {len(debug_rows)} | Opportunita: {len(opportunity_rows)} | Scartati: {len(rejected_rows)}"
+        )
+        time.sleep(0.002 if fast_mode else 0.01)
 
     progress.empty()
+    status_box.empty()
 
     opp_df = pd.DataFrame(opportunity_rows)
     debug_df = pd.DataFrame(debug_rows)
@@ -1096,9 +1165,10 @@ with st.sidebar:
     matching_mode = st.selectbox("Modalita matching", ["Sport strict", "Crypto strict", "Macro/Fed strict", "Auto strict"], index=0)
     poly_download = st.slider("Mercati Polymarket da scaricare", 500, 8000, 3000, step=500)
     kalshi_download = st.slider("Mercati Kalshi da scaricare", 100, 3000, 1000, step=100)
-    top_poly = st.slider("Top Polymarket usati nello scanner", 20, 1500, 500, step=10)
-    top_kalshi = st.slider("Top Kalshi usati nello scanner", 20, 3000, 1000, step=20)
-    max_pairs = st.slider("Pair candidati da analizzare", 10, 1000, 300, step=10)
+    top_poly = st.slider("Top Polymarket usati nello scanner", 20, 1500, 300, step=10)
+    top_kalshi = st.slider("Top Kalshi usati nello scanner", 20, 3000, 600, step=20)
+    max_pairs = st.slider("Pair candidati da analizzare", 10, 1000, 150, step=10)
+    fast_mode = st.checkbox("Modalita veloce", value=True)
     min_similarity = st.slider("Similarita\' minima matching", 0.05, 0.95, 0.35, step=0.01)
     min_edge_pct = st.number_input("Mostra solo edge netto >= %", min_value=-20.0, max_value=20.0, value=0.0, step=0.1)
     capital_per_trade = Decimal(str(st.number_input("Capitale per trade ($)", min_value=1.0, max_value=100000.0, value=100.0, step=50.0)))
@@ -1129,7 +1199,7 @@ with tab_scan:
         "Lo scanner prova a trovare mercati simili tra le due piattaforme e calcola un edge teorico. "
         "Le opportunita' con confidence Media/Bassa vanno verificate manualmente: wording e regole di settlement possono essere diversi."
     )
-    st.info("Nuova logica: Kalshi single-market only. I bundle/multi-event vengono scartati prima del matching.")
+    st.info("Nuova logica: Kalshi single-market only. I bundle/multi-event vengono scartati prima del matching. In Modalita veloce legge gli orderbook solo sui pair compatibili.")
 
     if st.button("Avvia scanner", type="primary"):
         kalshi_removed = 0
@@ -1148,6 +1218,9 @@ with tab_scan:
             f"{len(kalshi_sorted)} Kalshi usati su {len(kalshi_all)} single-market validi; "
             f"{kalshi_removed} Kalshi bundle/multi scartati."
         )
+        if fast_mode:
+            st.caption("Modalita veloce attiva: gli orderbook vengono letti solo dopo i controlli di compatibilita strutturale.")
+
         if len(poly_all) <= 100 and poly_download > 100:
             st.warning(
                 "Polymarket ha restituito solo 100 mercati anche se lo slider richiede di piu'. "
@@ -1158,7 +1231,7 @@ with tab_scan:
             st.warning("Pochi dati trovati. Prova filtro vuoto oppure una keyword piu' ampia: crypto, election, fed, inflation.")
         else:
             min_edge = Decimal(str(min_edge_pct)) / Decimal("100")
-            df, debug_df, rejected_df = scan_opportunities(poly_sorted, kalshi_sorted, min_similarity, max_pairs, buffer_bps, min_edge, read_orderbooks, capital_per_trade, matching_mode)
+            df, debug_df, rejected_df = scan_opportunities(poly_sorted, kalshi_sorted, min_similarity, max_pairs, buffer_bps, min_edge, read_orderbooks, capital_per_trade, matching_mode, fast_mode)
 
             view_cols = [
                 "edge_netto_%", "roi_netto_%", "profitto_stimato_$", "capitale_trade", "trade", "confidence", "similarity",
