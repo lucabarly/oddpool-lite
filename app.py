@@ -17,7 +17,7 @@ import streamlit as st
 # Polymarket + bookmaker odds benchmark via The Odds API
 # ============================================================
 
-APP_VERSION = "PolyEdge Scanner v1.5 - event-date fix + event endpoint for extra markets"
+APP_VERSION = "PolyEdge Scanner v1.7 - period/half market filter + bookmaker arbitrage"
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
@@ -405,6 +405,47 @@ def looks_like_single_game_market(question: str) -> bool:
     return False
 
 
+def has_period_or_half_scope(question: str) -> bool:
+    """
+    Blocca mercati parziali quando The Odds API sta fornendo mercati full-game.
+    Esempio da bloccare:
+    - Both Teams to Score in Second Half
+    se il bookmaker market e' solo btts full match.
+    """
+    q = canonical(question)
+    period_terms = [
+        "first half",
+        "second half",
+        "1st half",
+        "2nd half",
+        "first period",
+        "second period",
+        "third period",
+        "1st period",
+        "2nd period",
+        "3rd period",
+        "first quarter",
+        "second quarter",
+        "third quarter",
+        "fourth quarter",
+        "1st quarter",
+        "2nd quarter",
+        "3rd quarter",
+        "4th quarter",
+        "first inning",
+        "second inning",
+        "third inning",
+        "first set",
+        "second set",
+        "third set",
+        "in the second half",
+        "in second half",
+        "in the first half",
+        "in first half",
+    ]
+    return any(t in q for t in period_terms)
+
+
 def poly_market_type(question: str) -> str:
     q = canonical(question)
 
@@ -600,9 +641,12 @@ def is_relevant_poly_market(m: Dict[str, Any], theme: str) -> bool:
             if term and term not in q:
                 return False
 
-    # In questa versione usiamo quote bookmaker di singole partite.
-    # Quindi escludiamo championship/outright/stagionali.
+    # In questa versione usiamo quote bookmaker full-game.
+    # Quindi escludiamo championship/outright/stagionali e mercati parziali half/quarter/period.
     if is_outright_or_season_market(question):
+        return False
+
+    if has_period_or_half_scope(question):
         return False
 
     # Sports-focused single-game first version.
@@ -1022,6 +1066,11 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
         if p_type in {"unknown", "outright"}:
             continue
 
+        # The Odds API core markets here are full-game.
+        # Do not compare partial Polymarket markets such as second-half BTTS to full-match BTTS.
+        if has_period_or_half_scope(q_match_text):
+            continue
+
         if not looks_like_single_game_market(q_match_text):
             continue
 
@@ -1203,6 +1252,165 @@ def evaluate_candidates(candidates: pd.DataFrame, capital: Decimal, read_orderbo
     return out
 
 
+
+# ============================================================
+# Bookmaker vs Bookmaker arbitrage
+# ============================================================
+
+def bookmaker_outcome_group_key(row: pd.Series) -> Optional[Tuple[str, str, str, str, str, str]]:
+    """
+    Group per arbitraggio bookmaker.
+    V1.6: gestiamo in modo sicuro h2h, totals e btts.
+    Spread/player props sono esclusi dall'arbitraggio puro perché richiedono normalizzazione più delicata.
+    """
+    market_key = str(row.get("market_key") or "")
+
+    if market_key not in {"h2h", "totals", "btts"}:
+        return None
+
+    point = row.get("point")
+    if pd.isna(point) or point is None:
+        point_key = ""
+    else:
+        point_key = str(point)
+
+    return (
+        str(row.get("event_id")),
+        str(row.get("event")),
+        str(row.get("event_date")),
+        str(row.get("start")),
+        market_key,
+        point_key,
+    )
+
+
+def find_bookmaker_arbitrage(odds_df: pd.DataFrame, capital: Decimal, min_roi: Decimal) -> pd.DataFrame:
+    """
+    Cerca arbitraggio puro tra bookmaker.
+    Formula:
+        sum(1 / best_odds_per_outcome) < 1
+    """
+    if odds_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    tmp = odds_df.copy()
+    tmp["_arb_group"] = tmp.apply(bookmaker_outcome_group_key, axis=1)
+    tmp = tmp[tmp["_arb_group"].notna()].copy()
+
+    if tmp.empty:
+        return pd.DataFrame()
+
+    for group_key, g in tmp.groupby("_arb_group", dropna=False):
+        event_id, event, event_date, start, market_key, point_key = group_key
+
+        # At least 2 possible outcomes required.
+        outcomes = sorted([x for x in g["outcome"].dropna().unique().tolist() if str(x).strip()])
+        if len(outcomes) < 2:
+            continue
+
+        # For totals/btts we require exactly the natural opposite sides when possible.
+        if market_key == "totals":
+            norm_outcomes = set(canonical(x) for x in outcomes)
+            if not {"over", "under"}.issubset(norm_outcomes):
+                continue
+
+        if market_key == "btts":
+            norm_outcomes = set(canonical(x) for x in outcomes)
+            if not {"yes", "no"}.issubset(norm_outcomes):
+                continue
+
+        bests = []
+        for outcome in outcomes:
+            gg = g[g["outcome"] == outcome].copy()
+            if gg.empty:
+                continue
+
+            idx = gg["decimal_odds"].idxmax()
+            best = gg.loc[idx]
+            odds = dec(best["decimal_odds"])
+            if odds <= 1:
+                continue
+
+            implied = implied_prob_from_decimal_odds(odds)
+            if implied is None:
+                continue
+
+            bests.append({
+                "outcome": str(outcome),
+                "bookmaker": str(best.get("bookmaker") or ""),
+                "bookmaker_key": str(best.get("bookmaker_key") or ""),
+                "odds": odds,
+                "implied": implied,
+            })
+
+        if len(bests) < 2:
+            continue
+
+        inv_sum = sum([x["implied"] for x in bests], Decimal("0"))
+        if inv_sum <= 0:
+            continue
+
+        roi = (Decimal("1") / inv_sum) - Decimal("1")
+        if roi < min_roi:
+            continue
+
+        guaranteed_payout = capital / inv_sum
+        guaranteed_profit = guaranteed_payout - capital
+
+        stake_plan = []
+        for x in bests:
+            stake = guaranteed_payout / x["odds"]
+            stake_plan.append({
+                "outcome": x["outcome"],
+                "bookmaker": x["bookmaker"],
+                "odds": float(x["odds"]),
+                "stake": float(stake),
+                "stake_$": fmt_money(stake),
+                "payout_if_wins_$": fmt_money(stake * x["odds"]),
+            })
+
+        is_true_arb = inv_sum < Decimal("1")
+
+        rows.append({
+            "is_arbitrage": is_true_arb,
+            "roi": float(roi),
+            "roi_%": fmt_pct(roi),
+            "guaranteed_profit_$": fmt_money(guaranteed_profit),
+            "capital": fmt_money(capital),
+            "event": event,
+            "event_date": event_date,
+            "start": start,
+            "market_key": market_key,
+            "point": point_key,
+            "implied_sum": float(inv_sum),
+            "best_prices": " | ".join([f"{x['outcome']} @ {float(x['odds']):.3f} ({x['bookmaker']})" for x in bests]),
+            "stake_plan": json.dumps(stake_plan, ensure_ascii=False),
+            "event_id": event_id,
+        })
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["is_arbitrage", "roi"], ascending=[False, False])
+    return out
+
+
+def add_bookmaker_paper_trade(row: Dict[str, Any]):
+    trade = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "type": "bookmaker_arbitrage",
+        "event": row.get("event"),
+        "market_key": row.get("market_key"),
+        "point": row.get("point"),
+        "roi_%": row.get("roi_%"),
+        "guaranteed_profit_$": row.get("guaranteed_profit_$"),
+        "capital": row.get("capital"),
+        "best_prices": row.get("best_prices"),
+        "stake_plan": row.get("stake_plan"),
+    }
+    st.session_state.paper_trades.append(trade)
+
+
 # ============================================================
 # Paper trade log
 # ============================================================
@@ -1240,8 +1448,8 @@ st.title("PolyEdge Scanner")
 st.caption(APP_VERSION)
 
 st.info(
-    "Obiettivo: usare Polymarket come mercato tradabile e le quote bookmaker come benchmark di probabilita. "
-    "Questa versione NON usa Kalshi."
+    "Obiettivo: usare Polymarket come mercato tradabile, le quote bookmaker come benchmark, "
+    "e confrontare anche i bookmaker tra loro per arbitraggio teorico. Questa versione NON usa Kalshi."
 )
 
 st.warning(
@@ -1332,6 +1540,17 @@ with st.sidebar:
     capital = dec(st.number_input("Capitale per trade ($)", min_value=1.0, max_value=100000.0, value=100.0, step=25.0))
     min_edge_pct = st.number_input("Edge minimo vs Polymarket ask (%)", min_value=-50.0, max_value=50.0, value=2.0, step=0.25)
     min_edge = dec(min_edge_pct) / Decimal("100")
+
+    min_bookmaker_arb_roi_pct = st.number_input(
+        "ROI minimo bookmaker arbitrage (%)",
+        min_value=-10.0,
+        max_value=50.0,
+        value=0.0,
+        step=0.10,
+        help="0 mostra solo arbitraggio puro o quasi. Usa 0.2 / 0.5 per filtrare rumore."
+    )
+    min_bookmaker_arb_roi = dec(min_bookmaker_arb_roi_pct) / Decimal("100")
+
     read_orderbooks = st.checkbox("Leggi orderbook Polymarket live", value=True)
     auto_refresh = st.checkbox("Auto-refresh 60 secondi", value=False)
 
@@ -1344,10 +1563,11 @@ if auto_refresh:
     st.rerun()
 
 
-tab_scan, tab_poly, tab_odds, tab_paper, tab_setup = st.tabs([
+tab_scan, tab_poly, tab_odds, tab_arb, tab_paper, tab_setup = st.tabs([
     "Scanner",
     "Polymarket",
     "Bookmaker Odds",
+    "Bookmaker Arbitrage",
     "Paper Trade",
     "Setup",
 ])
@@ -1512,6 +1732,99 @@ with tab_odds:
                 st.dataframe(odds_best[show_cols].head(1000), width="stretch", hide_index=True)
 
 
+
+with tab_arb:
+    st.subheader("Bookmaker vs Bookmaker Arbitrage")
+
+    st.info(
+        "Questa tab confronta i bookmaker tra loro sullo stesso evento/mercato. "
+        "Per ora l'arbitraggio puro viene calcolato in modo sicuro su h2h, totals e btts quando disponibili."
+    )
+
+    if not odds_api_key:
+        st.error("Inserisci The Odds API key.")
+    elif not regions or not core_markets_selected:
+        st.error("Seleziona almeno una regione e almeno un mercato core.")
+    elif not selected_sports:
+        st.error("Seleziona almeno uno sport.")
+    elif st.button("Avvia bookmaker arbitrage scanner", type="primary"):
+        with st.spinner("Scarico quote bookmaker multi-sport..."):
+            odds_events, quota_rows, odds_errors = fetch_odds_multi_sport(
+                odds_api_key,
+                selected_sports,
+                ",".join(regions),
+                core_markets_selected,
+                extra_markets_selected,
+                "decimal",
+                max_extra_events_per_sport,
+            )
+
+        if odds_errors:
+            with st.expander("The Odds API: note tecniche"):
+                st.write("Alcuni sport/mercati extra possono non essere disponibili con il piano/API corrente. Gli errori non bloccano lo scanner.")
+                st.write(odds_errors[:30])
+
+        odds_df = flatten_odds(odds_events)
+
+        st.caption(
+            f"Dataset bookmaker: {len(odds_events)} eventi odds da {len(selected_sports)} sport; "
+            f"{len(odds_df)} quote bookmaker."
+        )
+
+        if quota_rows:
+            last_quota = quota_rows[-1]
+            st.caption(
+                f"Odds API quota ultima richiesta: remaining={last_quota.get('requests_remaining')} "
+                f"used={last_quota.get('requests_used')} last={last_quota.get('requests_last')}"
+            )
+
+        if odds_df.empty:
+            st.warning("Nessuna quota bookmaker trovata.")
+        else:
+            arb_df = find_bookmaker_arbitrage(odds_df, capital, min_bookmaker_arb_roi)
+
+            if arb_df.empty:
+                st.info("Nessun arbitraggio bookmaker sopra la soglia impostata.")
+            else:
+                show_cols = [
+                    "is_arbitrage", "roi_%", "guaranteed_profit_$", "capital",
+                    "event", "event_date", "start", "market_key", "point",
+                    "best_prices", "implied_sum"
+                ]
+                st.dataframe(arb_df[show_cols].head(300), width="stretch", hide_index=True)
+
+                st.download_button(
+                    "Scarica CSV bookmaker arbitrage",
+                    arb_df.to_csv(index=False).encode("utf-8"),
+                    file_name="bookmaker_arbitrage.csv",
+                    mime="text/csv",
+                )
+
+                real_arbs = arb_df[arb_df["is_arbitrage"] == True].copy()
+                if not real_arbs.empty:
+                    st.success(f"Trovati {len(real_arbs)} arbitrage teorici bookmaker.")
+                    selected_arb_idx = st.selectbox(
+                        "Aggiungi arbitraggio al paper trade",
+                        real_arbs.index.tolist(),
+                        format_func=lambda i: f"{real_arbs.loc[i, 'roi_%']} | {real_arbs.loc[i, 'event']} | {real_arbs.loc[i, 'market_key']}"
+                    )
+
+                    selected_row = real_arbs.loc[selected_arb_idx].to_dict()
+
+                    with st.expander("Stake plan selezionato"):
+                        try:
+                            stake_df = pd.DataFrame(json.loads(selected_row.get("stake_plan") or "[]"))
+                            st.dataframe(stake_df, width="stretch", hide_index=True)
+                        except Exception:
+                            st.write(selected_row.get("stake_plan"))
+
+                    if st.button("Aggiungi Arbitrage Paper Trade"):
+                        add_bookmaker_paper_trade(selected_row)
+                        st.success("Arbitrage paper trade aggiunto.")
+                else:
+                    st.info("Ci sono righe sopra soglia, ma nessun arbitraggio puro con implied_sum < 1.")
+
+
 with tab_paper:
     st.subheader("Paper Trade Log")
 
@@ -1558,11 +1871,19 @@ Da v1.5 non devi scegliere uno sport singolo: puoi usare Auto-scan multi-sport. 
 
 I mercati core (`h2h`, `spreads`, `totals`) vengono richiesti dall'endpoint generale. I mercati extra/player props vengono provati tramite endpoint singolo evento, con un limite configurabile per non consumare troppa quota.
 
-Il segnale principale è:
+I segnali principali sono:
 
 ```text
-edge = fair_probability_bookmaker_no_vig - polymarket_yes_ask
+1. Polymarket value:
+   edge = fair_probability_bookmaker_no_vig - polymarket_yes_ask
+
+2. Bookmaker arbitrage:
+   sum(1 / best_odds_per_outcome) < 1
 ```
+
+Nel secondo caso l'app calcola anche lo stake plan teorico per distribuire il capitale tra i bookmaker.
+
+Da v1.7 l'app esclude i mercati Polymarket parziali come `first half`, `second half`, `quarter`, `period`, `inning`, quando li confronterebbe contro quote bookmaker full-game. Questo evita falsi positivi tipo `Both Teams to Score in Second Half` vs `BTTS full match`.
 
 Importante: questa versione confronta solo mercati Polymarket che sembrano riferiti a singole partite/eventi.
 Mercati stagionali/outright come Championship, Super Bowl, division winner, MVP, World Cup winner vengono esclusi perché non sono confrontabili con quote h2h di una singola partita.
