@@ -17,7 +17,7 @@ import streamlit as st
 # Polymarket + bookmaker odds benchmark via The Odds API
 # ============================================================
 
-APP_VERSION = "PolyEdge Scanner v1.7 - period/half market filter + bookmaker arbitrage"
+APP_VERSION = "PolyEdge Scanner v1.8 - explicit YES/NO hedge instructions"
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
@@ -1147,6 +1147,8 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
                 if fair_prob is None:
                     fair_prob = Decimal(str(best["avg_market_implied_probability"]))
 
+                bookmaker_best_outcomes = build_best_outcomes_for_group(group_for_probs)
+
                 confidence = "Media"
                 if int(best["books_compared"]) >= 3 and sim >= Decimal("0.18"):
                     confidence = "Alta"
@@ -1177,6 +1179,7 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
                     "best_odds": best["best_odds"],
                     "books_compared": best["books_compared"],
                     "fair_probability": float(fair_prob),
+                    "bookmaker_best_outcomes": json.dumps(bookmaker_best_outcomes, ensure_ascii=False),
                     "event_id": event_id,
                 })
 
@@ -1186,6 +1189,267 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
         out["_conf_order"] = out["confidence"].map(conf_order).fillna(9)
         out = out.sort_values(["_conf_order", "similarity", "poly_volume"], ascending=[True, False, False]).drop(columns=["_conf_order"])
     return out
+
+
+
+def build_best_outcomes_for_group(group_for_probs: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Ritorna la migliore quota bookmaker per ogni outcome dello stesso evento/mercato/linea.
+    Serve per costruire hedge Polymarket YES + bookmaker NOT-YES.
+    """
+    bests = []
+    if group_for_probs is None or group_for_probs.empty:
+        return bests
+
+    for outcome, gg in group_for_probs.groupby("outcome", dropna=False):
+        if gg.empty:
+            continue
+
+        idx = gg["best_odds"].idxmax()
+        best = gg.loc[idx]
+        odds = dec(best.get("best_odds"))
+        if odds <= 1:
+            continue
+
+        bests.append({
+            "outcome": str(best.get("outcome") or outcome),
+            "point": "" if pd.isna(best.get("point")) else str(best.get("point")),
+            "bookmaker": str(best.get("best_bookmaker") or ""),
+            "odds": float(odds),
+        })
+
+    return bests
+
+
+def best_outcomes_json_to_list(x: Any) -> List[Dict[str, Any]]:
+    try:
+        data = json.loads(str(x or "[]"))
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception:
+        return []
+
+
+def split_target_and_not_target(best_outcomes: List[Dict[str, Any]], target_outcome: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    target = None
+    others = []
+
+    target_norm = canonical(target_outcome)
+
+    for x in best_outcomes:
+        out_norm = canonical(x.get("outcome") or "")
+        if out_norm == target_norm and target is None:
+            target = x
+        else:
+            others.append(x)
+
+    return target, others
+
+
+def hedge_plan_bookmaker_yes_poly_no(
+    target: Dict[str, Any],
+    poly_no_ask: Decimal,
+    capital: Decimal,
+) -> Dict[str, Any]:
+    """
+    Strategia:
+    - Bookmaker: compra/bet YES sull'outcome del mercato Polymarket
+    - Polymarket: compra NO
+
+    Costo normalizzato per payout 1:
+        1 / bookmaker_yes_odds + poly_no_ask
+
+    Se costo < 1 = arbitraggio teorico.
+    """
+    odds = dec(target.get("odds"))
+    if odds <= 1 or poly_no_ask <= 0:
+        return {}
+
+    book_cost_unit = Decimal("1") / odds
+    combo_cost = book_cost_unit + poly_no_ask
+    roi = (Decimal("1") / combo_cost) - Decimal("1") if combo_cost > 0 else None
+
+    guaranteed_payout = capital / combo_cost if combo_cost > 0 else Decimal("0")
+    bookmaker_stake = guaranteed_payout / odds
+    polymarket_no_cost = guaranteed_payout * poly_no_ask
+    profit = guaranteed_payout - capital
+
+    return {
+        "strategy": "HEDGE: Bookmaker YES + Polymarket NO",
+        "combo_cost": combo_cost,
+        "roi": roi,
+        "profit": profit,
+        "poly_leg": f"Compra NO Polymarket @ {fmt_price(poly_no_ask)}",
+        "book_leg": f"Punta YES bookmaker: {target.get('outcome')} @ {float(odds):.3f} ({target.get('bookmaker')})",
+        "stake_plan": json.dumps([
+            {
+                "site": "Bookmaker",
+                "bookmaker": target.get("bookmaker"),
+                "outcome": target.get("outcome"),
+                "odds": float(odds),
+                "stake_$": fmt_money(bookmaker_stake),
+                "payout_if_wins_$": fmt_money(bookmaker_stake * odds),
+            },
+            {
+                "site": "Polymarket",
+                "outcome": "NO",
+                "price": float(poly_no_ask),
+                "cost_$": fmt_money(polymarket_no_cost),
+                "payout_if_wins_$": fmt_money(guaranteed_payout),
+            },
+        ], ensure_ascii=False),
+    }
+
+
+def hedge_plan_poly_yes_bookmaker_not(
+    target: Dict[str, Any],
+    others: List[Dict[str, Any]],
+    poly_yes_ask: Decimal,
+    capital: Decimal,
+) -> Dict[str, Any]:
+    """
+    Strategia:
+    - Polymarket: compra YES
+    - Bookmaker: copri NOT-YES puntando tutti gli altri outcome disponibili.
+
+    Per h2h soccer a 3 esiti:
+        Polymarket YES = Team A vince
+        Bookmaker NOT-YES = Draw + Team B
+    """
+    if poly_yes_ask <= 0 or not others:
+        return {}
+
+    other_cost_unit = Decimal("0")
+    clean_others = []
+
+    for x in others:
+        odds = dec(x.get("odds"))
+        if odds <= 1:
+            continue
+        other_cost_unit += Decimal("1") / odds
+        clean_others.append({**x, "odds_dec": odds})
+
+    if not clean_others:
+        return {}
+
+    combo_cost = poly_yes_ask + other_cost_unit
+    roi = (Decimal("1") / combo_cost) - Decimal("1") if combo_cost > 0 else None
+
+    guaranteed_payout = capital / combo_cost if combo_cost > 0 else Decimal("0")
+    polymarket_yes_cost = guaranteed_payout * poly_yes_ask
+    profit = guaranteed_payout - capital
+
+    stake_rows = [
+        {
+            "site": "Polymarket",
+            "outcome": "YES",
+            "price": float(poly_yes_ask),
+            "cost_$": fmt_money(polymarket_yes_cost),
+            "payout_if_wins_$": fmt_money(guaranteed_payout),
+        }
+    ]
+
+    book_leg_parts = []
+    for x in clean_others:
+        odds = x["odds_dec"]
+        stake = guaranteed_payout / odds
+        book_leg_parts.append(f"{x.get('outcome')} @ {float(odds):.3f} ({x.get('bookmaker')})")
+        stake_rows.append({
+            "site": "Bookmaker",
+            "bookmaker": x.get("bookmaker"),
+            "outcome": x.get("outcome"),
+            "odds": float(odds),
+            "stake_$": fmt_money(stake),
+            "payout_if_wins_$": fmt_money(stake * odds),
+        })
+
+    return {
+        "strategy": "HEDGE: Polymarket YES + Bookmaker NOT-YES",
+        "combo_cost": combo_cost,
+        "roi": roi,
+        "profit": profit,
+        "poly_leg": f"Compra YES Polymarket @ {fmt_price(poly_yes_ask)}",
+        "book_leg": "Punta NOT-YES bookmaker: " + " + ".join(book_leg_parts),
+        "stake_plan": json.dumps(stake_rows, ensure_ascii=False),
+    }
+
+
+def pick_best_operational_strategy(
+    simple_action: str,
+    simple_edge: Optional[Decimal],
+    simple_ev: Optional[Decimal],
+    poly_yes_ask: Optional[Decimal],
+    poly_yes_bid: Optional[Decimal],
+    target_outcome: str,
+    best_outcomes_json: Any,
+    capital: Decimal,
+    min_edge: Decimal,
+) -> Dict[str, Any]:
+    """
+    Sceglie la migliore azione operativa tra:
+    - solo BUY YES Polymarket
+    - solo BUY NO Polymarket
+    - hedge bookmaker YES + Polymarket NO
+    - hedge Polymarket YES + bookmaker NOT-YES
+    """
+    strategies = []
+
+    if poly_yes_ask is not None and poly_yes_ask > 0 and simple_edge is not None:
+        strategies.append({
+            "strategy": simple_action,
+            "roi": simple_edge / poly_yes_ask if poly_yes_ask > 0 else None,
+            "profit": simple_ev,
+            "combo_cost": None,
+            "poly_leg": f"Compra YES Polymarket @ {fmt_price(poly_yes_ask)}" if simple_action == "BUY YES Polymarket" else "",
+            "book_leg": "",
+            "stake_plan": "",
+        })
+
+    # BUY NO Polymarket semplice, quando YES e' caro rispetto al fair bookmaker.
+    # fair_no = 1 - fair_yes
+    # no_ask approx = 1 - yes_bid
+    best_outcomes = best_outcomes_json_to_list(best_outcomes_json)
+    target, others = split_target_and_not_target(best_outcomes, target_outcome)
+
+    if poly_yes_bid is not None and poly_yes_bid > 0:
+        poly_no_ask = Decimal("1") - poly_yes_bid
+
+        # Hedging: bookmaker target YES + Polymarket NO
+        if target:
+            plan = hedge_plan_bookmaker_yes_poly_no(target, poly_no_ask, capital)
+            if plan and plan.get("roi") is not None:
+                strategies.append(plan)
+
+        # Hedging: Polymarket YES + bookmaker NOT-YES
+        if poly_yes_ask is not None and poly_yes_ask > 0 and others:
+            plan = hedge_plan_poly_yes_bookmaker_not(target or {}, others, poly_yes_ask, capital)
+            if plan and plan.get("roi") is not None:
+                strategies.append(plan)
+
+    valid_strategies = []
+    for s in strategies:
+        roi = s.get("roi")
+        if roi is None:
+            continue
+
+        # Keep positive hedge/arbitrage. For simple value, require min_edge threshold handled outside.
+        if roi > Decimal("0"):
+            valid_strategies.append(s)
+
+    if not valid_strategies:
+        return {
+            "strategy": "NO TRADE",
+            "roi": None,
+            "profit": None,
+            "combo_cost": None,
+            "poly_leg": "",
+            "book_leg": "",
+            "stake_plan": "",
+        }
+
+    best = sorted(valid_strategies, key=lambda x: x.get("roi") or Decimal("-999"), reverse=True)[0]
+    return best
 
 
 def evaluate_candidates(candidates: pd.DataFrame, capital: Decimal, read_orderbooks: bool, min_edge: Decimal) -> pd.DataFrame:
@@ -1206,37 +1470,73 @@ def evaluate_candidates(candidates: pd.DataFrame, capital: Decimal, read_orderbo
             poly_bid, poly_ask, book_status = get_poly_orderbook(str(token))
 
         if poly_bid is None or poly_ask is None:
-            raw = None
-            # p raw is not in candidates, fallback unavailable here.
             book_status = book_status if book_status != "not read" else "missing price"
 
-        fair = dec(row.get("fair_probability"), "0")
+        fair_yes = dec(row.get("fair_probability"), "0")
         ask = poly_ask
+        bid = poly_bid
 
-        edge = None
-        ev_on_capital = None
-        suggested_action = "No trade"
+        edge_yes = None
+        ev_yes = None
+        simple_action = "NO TRADE"
 
-        if ask is not None and ask > 0 and fair > 0:
-            edge = fair - ask
-            ev_on_capital = (capital / ask) * edge if ask > 0 else None
+        if ask is not None and ask > 0 and fair_yes > 0:
+            edge_yes = fair_yes - ask
+            ev_yes = (capital / ask) * edge_yes if ask > 0 else None
 
-            if edge >= min_edge:
-                suggested_action = "BUY YES Polymarket"
-            elif edge <= -min_edge:
-                suggested_action = "NO BUY - bookmaker fair lower"
+            if edge_yes >= min_edge:
+                simple_action = "BUY YES Polymarket"
+            elif edge_yes <= -min_edge:
+                simple_action = "BUY NO Polymarket candidate"
+            else:
+                simple_action = "NO TRADE"
+
+        chosen = pick_best_operational_strategy(
+            simple_action=simple_action,
+            simple_edge=edge_yes,
+            simple_ev=ev_yes,
+            poly_yes_ask=ask,
+            poly_yes_bid=bid,
+            target_outcome=str(row.get("odds_outcome") or ""),
+            best_outcomes_json=row.get("bookmaker_best_outcomes"),
+            capital=capital,
+            min_edge=min_edge,
+        )
+
+        combo_cost = chosen.get("combo_cost")
+        combo_roi = chosen.get("roi")
+        combo_profit = chosen.get("profit")
+
+        # Add explicit opposite approximations.
+        poly_no_ask = None
+        if bid is not None:
+            poly_no_ask = Decimal("1") - bid
+
+        operational_action = chosen.get("strategy") or "NO TRADE"
 
         rows.append({
             **row.to_dict(),
+
+            # Original Polymarket value columns.
             "poly_bid": fmt_price(poly_bid),
             "poly_ask": fmt_price(poly_ask),
+            "poly_no_ask_stimato": fmt_price(poly_no_ask),
             "book_status": book_status,
-            "fair_probability_%": fmt_pct(fair),
-            "edge_vs_poly_ask": float(edge) if edge is not None else None,
-            "edge_vs_poly_ask_%": fmt_pct(edge),
+            "fair_probability_%": fmt_pct(fair_yes),
+            "edge_vs_poly_ask": float(edge_yes) if edge_yes is not None else None,
+            "edge_vs_poly_ask_%": fmt_pct(edge_yes),
             "capital": fmt_money(capital),
-            "estimated_ev_$": fmt_money(ev_on_capital),
-            "suggested_action": suggested_action,
+            "estimated_ev_$": fmt_money(ev_yes),
+            "suggested_action": simple_action,
+
+            # New explicit operational columns.
+            "azione_operativa": operational_action,
+            "compra_polymarket": chosen.get("poly_leg") or "",
+            "compra_bookmaker": chosen.get("book_leg") or "",
+            "costo_combo": fmt_price(combo_cost) if combo_cost is not None else "",
+            "roi_combo_%": fmt_pct(combo_roi) if combo_roi is not None else "",
+            "profitto_teorico_$": fmt_money(combo_profit) if combo_profit is not None else "",
+            "stake_plan": chosen.get("stake_plan") or "",
         })
 
         pct = i / total
@@ -1248,9 +1548,11 @@ def evaluate_candidates(candidates: pd.DataFrame, capital: Decimal, read_orderbo
 
     out = pd.DataFrame(rows)
     if not out.empty:
-        out = out.sort_values(["suggested_action", "edge_vs_poly_ask", "similarity"], ascending=[True, False, False], na_position="last")
+        # Put real hedge/arbitrage candidates first.
+        out["_roi_sort"] = out["roi_combo_%"].apply(lambda x: float(str(x).replace("%", "")) if str(x).strip().endswith("%") else -999)
+        out = out.sort_values(["azione_operativa", "_roi_sort", "edge_vs_poly_ask", "similarity"], ascending=[True, False, False, False], na_position="last")
+        out = out.drop(columns=["_roi_sort"])
     return out
-
 
 
 # ============================================================
@@ -1423,13 +1725,19 @@ def init_paper_log():
 def add_paper_trade(row: Dict[str, Any], stake: Decimal):
     trade = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "action": row.get("suggested_action"),
+        "action": row.get("azione_operativa") or row.get("suggested_action"),
         "stake": float(stake),
         "polymarket_question": row.get("polymarket_question"),
         "poly_ask": row.get("poly_ask"),
+        "poly_no_ask_stimato": row.get("poly_no_ask_stimato"),
         "fair_probability_%": row.get("fair_probability_%"),
         "edge_vs_poly_ask_%": row.get("edge_vs_poly_ask_%"),
         "estimated_ev_$": row.get("estimated_ev_$"),
+        "compra_polymarket": row.get("compra_polymarket"),
+        "compra_bookmaker": row.get("compra_bookmaker"),
+        "roi_combo_%": row.get("roi_combo_%"),
+        "profitto_teorico_$": row.get("profitto_teorico_$"),
+        "stake_plan": row.get("stake_plan"),
         "poly_link": row.get("poly_link"),
         "odds_event": row.get("odds_event"),
         "best_bookmaker": row.get("best_bookmaker"),
@@ -1648,11 +1956,13 @@ with tab_scan:
                         st.info("Nessun candidato valutato.")
                     else:
                         main_cols = [
-                            "suggested_action", "confidence", "poly_market_type", "edge_vs_poly_ask_%", "estimated_ev_$",
-                            "capital", "poly_ask", "poly_bid", "fair_probability_%",
+                            "azione_operativa", "roi_combo_%", "profitto_teorico_$",
+                            "compra_polymarket", "compra_bookmaker", "costo_combo",
+                            "confidence", "poly_market_type", "edge_vs_poly_ask_%", "estimated_ev_$",
+                            "capital", "poly_ask", "poly_bid", "poly_no_ask_stimato", "fair_probability_%",
                             "polymarket_question", "odds_event", "poly_dates", "event_date", "event_date_et", "event_start",
                             "odds_market", "odds_outcome", "best_bookmaker", "best_odds",
-                            "books_compared", "poly_link", "book_status"
+                            "books_compared", "poly_link", "book_status", "stake_plan"
                         ]
 
                         st.dataframe(evaluated[main_cols].head(300), width="stretch", hide_index=True)
@@ -1664,20 +1974,32 @@ with tab_scan:
                             mime="text/csv",
                         )
 
-                        buy_rows = evaluated[evaluated["suggested_action"] == "BUY YES Polymarket"].copy()
-                        if not buy_rows.empty:
-                            st.success(f"Trovati {len(buy_rows)} segnali BUY YES teorici sopra soglia.")
+                        action_rows = evaluated[evaluated["azione_operativa"] != "NO TRADE"].copy()
+                        if not action_rows.empty:
+                            st.success(f"Trovati {len(action_rows)} segnali operativi teorici.")
                             selected_idx = st.selectbox(
                                 "Aggiungi un segnale al paper trade",
-                                buy_rows.index.tolist(),
-                                format_func=lambda i: f"{buy_rows.loc[i, 'edge_vs_poly_ask_%']} | {buy_rows.loc[i, 'polymarket_question'][:90]}"
+                                action_rows.index.tolist(),
+                                format_func=lambda i: f"{action_rows.loc[i, 'azione_operativa']} | {action_rows.loc[i, 'roi_combo_%']} | {action_rows.loc[i, 'polymarket_question'][:80]}"
                             )
+
+                            with st.expander("Stake plan / istruzioni selezionate"):
+                                sel = action_rows.loc[selected_idx]
+                                st.write("Polymarket:", sel.get("compra_polymarket"))
+                                st.write("Bookmaker:", sel.get("compra_bookmaker"))
+                                try:
+                                    plan_df = pd.DataFrame(json.loads(sel.get("stake_plan") or "[]"))
+                                    if not plan_df.empty:
+                                        st.dataframe(plan_df, width="stretch", hide_index=True)
+                                except Exception:
+                                    st.write(sel.get("stake_plan"))
+
                             paper_stake = dec(st.number_input("Stake paper trade ($)", min_value=1.0, max_value=100000.0, value=float(capital), step=25.0))
                             if st.button("Aggiungi Paper Trade"):
-                                add_paper_trade(buy_rows.loc[selected_idx].to_dict(), paper_stake)
+                                add_paper_trade(action_rows.loc[selected_idx].to_dict(), paper_stake)
                                 st.success("Paper trade aggiunto.")
                         else:
-                            st.info("Nessun BUY YES sopra soglia. Puoi abbassare edge minimo o cambiare sport/filtro.")
+                            st.info("Nessun segnale operativo sopra soglia. Puoi abbassare edge minimo o cambiare sport/filtro.")
 
 
 with tab_poly:
@@ -1884,6 +2206,14 @@ I segnali principali sono:
 Nel secondo caso l'app calcola anche lo stake plan teorico per distribuire il capitale tra i bookmaker.
 
 Da v1.7 l'app esclude i mercati Polymarket parziali come `first half`, `second half`, `quarter`, `period`, `inning`, quando li confronterebbe contro quote bookmaker full-game. Questo evita falsi positivi tipo `Both Teams to Score in Second Half` vs `BTTS full match`.
+
+Da v1.8 la tabella mostra istruzioni operative esplicite:
+- cosa comprare su Polymarket;
+- quale esito puntare sul bookmaker;
+- prezzo/quota;
+- costo combinato;
+- ROI teorico;
+- stake plan.
 
 Importante: questa versione confronta solo mercati Polymarket che sembrano riferiti a singole partite/eventi.
 Mercati stagionali/outright come Championship, Super Bowl, division winner, MVP, World Cup winner vengono esclusi perché non sono confrontabili con quote h2h di una singola partita.
