@@ -17,7 +17,7 @@ KALSHI_BASE_ALT = "https://external-api.kalshi.com/trade-api/v2"
 
 st.set_page_config(page_title="Oddpool Lite Scanner", layout="wide")
 st.title("Oddpool Lite - Scanner automatico opportunita'")
-st.caption("Versione aggiornata: debug matching + matching permissivo")
+st.caption("Versione aggiornata: profitto stimato YES+NO + anti-falsi positivi + debug matching")
 st.caption(
     "Scanner gratuito Polymarket/Kalshi: trova mercati simili, legge top-of-book e calcola edge teorico. "
     "Non e' consulenza finanziaria e non esegue trade automatici."
@@ -168,6 +168,136 @@ def market_link_kalshi(m: Dict[str, Any]) -> str:
         return f"https://kalshi.com/markets/{ticker}"
     q = quote_plus(str(m.get("title") or ""))
     return f"https://kalshi.com/search?query={q}"
+
+
+def is_bad_kalshi_market(m: Dict[str, Any]) -> bool:
+    """
+    Esclude mercati Kalshi che generano moltissimi falsi positivi:
+    - multi-game sport extensions;
+    - cross-category bundles;
+    - titoli troppo lunghi con molti outcome separati da virgole.
+    """
+    ticker = str(m.get("ticker") or "").upper()
+    title = str(m.get("title") or "")
+    subtitle = str(m.get("subtitle") or "")
+    text = f"{title} {subtitle}".lower()
+
+    bad_ticker_parts = [
+        "MULTIGAME",
+        "CROSSCATEGORY",
+        "MULTI",
+        "PARLAY",
+    ]
+
+    if any(x in ticker for x in bad_ticker_parts):
+        return True
+
+    if text.count(",") >= 3:
+        return True
+
+    if len(text.split()) > 35:
+        return True
+
+    return False
+
+
+def valid_price_pair(bid: Optional[Decimal], ask: Optional[Decimal]) -> bool:
+    """
+    Prezzi 0.0000 su Kalshi spesso indicano assenza di book/contratto non realmente tradabile.
+    Per le opportunita' vogliamo prezzi strettamente dentro (0, 1).
+    """
+    if bid is None or ask is None:
+        return False
+    if bid <= 0 or ask <= 0:
+        return False
+    if bid >= 1 or ask >= 1:
+        return False
+    if bid > ask:
+        return False
+    return True
+
+
+def kalshi_display_question(m: Dict[str, Any]) -> str:
+    """
+    Kalshi spesso non ha una singola 'question' pulita come Polymarket.
+    Questa funzione ricostruisce una descrizione leggibile usando i campi disponibili.
+    """
+    parts = []
+    for key in [
+        "event_title", "eventTitle", "series_title", "seriesTitle",
+        "title", "subtitle", "yes_sub_title", "no_sub_title"
+    ]:
+        v = m.get(key)
+        if v and str(v).strip():
+            s = str(v).strip()
+            if s not in parts:
+                parts.append(s)
+
+    if not parts:
+        return str(m.get("ticker") or "")
+
+    return " | ".join(parts[:4])
+
+
+def kalshi_matching_text(m: Dict[str, Any]) -> str:
+    """
+    Testo usato per il matching. Evita di usare solo titoli tecnici poco leggibili.
+    """
+    fields = [
+        m.get("event_title"), m.get("eventTitle"), m.get("series_title"), m.get("seriesTitle"),
+        m.get("title"), m.get("subtitle"), m.get("yes_sub_title"), m.get("no_sub_title"),
+        m.get("category"), m.get("ticker"), m.get("event_ticker"), m.get("series_ticker"),
+    ]
+    return " ".join(str(x or "") for x in fields)
+
+
+def no_ask_from_yes_bid(yes_bid: Optional[Decimal]) -> Optional[Decimal]:
+    if yes_bid is None:
+        return None
+    return Decimal("1") - yes_bid
+
+
+def estimated_contracts_from_capital(capital: Decimal, cost_per_contract: Optional[Decimal]) -> Optional[Decimal]:
+    if cost_per_contract is None or cost_per_contract <= 0:
+        return None
+    return capital / cost_per_contract
+
+
+def fmt_money(x: Optional[Decimal]) -> str:
+    if x is None:
+        return ""
+    return f"${float(x):,.2f}"
+
+
+def fmt_decimal(x: Optional[Decimal]) -> str:
+    if x is None:
+        return ""
+    return f"{float(x):,.2f}"
+
+
+def arbitrage_yes_no(
+    yes_ask: Optional[Decimal],
+    opposite_yes_bid: Optional[Decimal],
+    buffer_bps: Decimal,
+) -> Tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+    """
+    Compra YES su una piattaforma + compra NO sull'altra.
+    NO ask viene stimato come 1 - YES bid dell'altra piattaforma.
+    Ritorna: costo netto per contratto, profitto netto per contratto, ROI netto.
+    """
+    no_ask = no_ask_from_yes_bid(opposite_yes_bid)
+
+    if yes_ask is None or no_ask is None:
+        return None, None, None
+    if yes_ask <= 0 or no_ask <= 0 or yes_ask >= 1 or no_ask >= 1:
+        return None, None, None
+
+    gross_cost = yes_ask + no_ask
+    buffer_cost = gross_cost * buffer_bps / Decimal("10000")
+    net_cost = gross_cost + buffer_cost
+    profit = Decimal("1") - net_cost
+    roi = profit / net_cost if net_cost > 0 else None
+    return net_cost, profit, roi
 
 
 # -----------------------------
@@ -414,7 +544,7 @@ def candidate_pairs(poly_markets: List[Dict[str, Any]], kalshi_markets: List[Dic
 
     k_index: Dict[str, List[int]] = {}
     for i, km in enumerate(kalshi_markets):
-        for kw in list(keywords(text_of_market(km)))[:30]:
+        for kw in list(keywords(kalshi_matching_text(km)))[:30]:
             k_index.setdefault(kw, []).append(i)
 
     for pm in poly_markets:
@@ -431,7 +561,7 @@ def candidate_pairs(poly_markets: List[Dict[str, Any]], kalshi_markets: List[Dic
         local = []
         for idx in possible_idx:
             km = kalshi_markets[idx]
-            score, details = similarity(pm_text, text_of_market(km))
+            score, details = similarity(pm_text, kalshi_matching_text(km))
             local.append((score, details, km))
 
         local.sort(key=lambda x: x[0], reverse=True)
@@ -459,6 +589,7 @@ def scan_opportunities(
     buffer_bps: Decimal,
     min_edge: Decimal,
     read_orderbooks: bool,
+    capital_per_trade: Decimal,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Ritorna due tabelle:
@@ -521,6 +652,36 @@ def scan_opportunities(
             best_edge = e2
             best_trade = "Compra YES Kalshi / vendi YES Polymarket"
 
+        # Arbitraggio piu' realistico: compra YES su una piattaforma + compra NO sull'altra.
+        # NO ask e' stimato come 1 - YES bid.
+        yn1_cost, yn1_profit, yn1_roi = arbitrage_yes_no(p_ask, k_bid, buffer_bps)
+        yn2_cost, yn2_profit, yn2_roi = arbitrage_yes_no(k_ask, p_bid, buffer_bps)
+
+        best_yn_cost = None
+        best_yn_profit = None
+        best_yn_roi = None
+        best_yn_trade = ""
+
+        if yn1_profit is not None:
+            best_yn_cost = yn1_cost
+            best_yn_profit = yn1_profit
+            best_yn_roi = yn1_roi
+            best_yn_trade = "Compra YES Polymarket + compra NO Kalshi"
+
+        if yn2_profit is not None and (best_yn_profit is None or yn2_profit > best_yn_profit):
+            best_yn_cost = yn2_cost
+            best_yn_profit = yn2_profit
+            best_yn_roi = yn2_roi
+            best_yn_trade = "Compra YES Kalshi + compra NO Polymarket"
+
+        # Per ordinare usiamo prima l'arbitraggio YES+NO, poi il vecchio spread buy/sell.
+        if best_yn_profit is not None:
+            best_edge = best_yn_profit
+            best_trade = best_yn_trade
+
+        contracts_est = estimated_contracts_from_capital(capital_per_trade, best_yn_cost)
+        profit_est = (contracts_est * best_yn_profit) if contracts_est is not None and best_yn_profit is not None else None
+
         if best_edge is None:
             reject_reason = reject_reason or "prezzi bid/ask insufficienti"
         elif best_edge < min_edge:
@@ -536,11 +697,21 @@ def scan_opportunities(
             "similarity": round(pair["similarity"], 3),
             "passes_similarity": pair.get("passes_similarity", False),
             "polymarket": pm.get("question") or pm.get("title") or pm.get("eventTitle"),
-            "kalshi": km.get("title") or km.get("subtitle") or km.get("ticker"),
+            "kalshi": kalshi_display_question(km),
+            "kalshi_title_raw": km.get("title"),
+            "kalshi_subtitle_raw": km.get("subtitle"),
             "poly_bid": fmt_price(p_bid),
             "poly_ask": fmt_price(p_ask),
+            "poly_no_ask_stimato": fmt_price(no_ask_from_yes_bid(p_bid)),
             "kalshi_bid": fmt_price(k_bid),
             "kalshi_ask": fmt_price(k_ask),
+            "kalshi_no_ask_stimato": fmt_price(no_ask_from_yes_bid(k_bid)),
+            "costo_per_contratto": fmt_price(best_yn_cost),
+            "profitto_per_contratto": fmt_price(best_yn_profit),
+            "roi_netto_%": fmt_pct(best_yn_roi),
+            "capitale_trade": fmt_money(capital_per_trade),
+            "contratti_stimati": fmt_decimal(contracts_est),
+            "profitto_stimato_$": fmt_money(profit_est),
             "poly_liquidity": to_float(pm.get("liquidity") or pm.get("liquidityNum")),
             "poly_volume24h": to_float(pm.get("volume24hr") or pm.get("volume24hrClob")),
             "kalshi_volume": to_float(km.get("volume")),
@@ -554,9 +725,34 @@ def scan_opportunities(
             "motivo_scarto": reject_reason,
         }
 
+        # Regole severe per la tabella opportunita':
+        # - niente mercati Kalshi multi-game/cross-category;
+        # - niente prezzi zero/mancanti;
+        # - niente confidence Bassa;
+        # - similarita sopra soglia.
+        is_real_candidate = (
+            best_yn_profit is not None
+            and best_yn_profit >= min_edge
+            and pair["similarity"] >= min_similarity
+            and confidence(pair["similarity"], pair["details"]) != "Bassa"
+            and not is_bad_kalshi_market(km)
+            and valid_price_pair(p_bid, p_ask)
+            and valid_price_pair(k_bid, k_ask)
+        )
+
+        if not is_real_candidate and not reject_reason:
+            if is_bad_kalshi_market(km):
+                base_row["motivo_scarto"] = "Kalshi multi-game/cross-category"
+            elif not valid_price_pair(k_bid, k_ask):
+                base_row["motivo_scarto"] = "prezzi Kalshi non validi o zero"
+            elif not valid_price_pair(p_bid, p_ask):
+                base_row["motivo_scarto"] = "prezzi Polymarket non validi"
+            elif confidence(pair["similarity"], pair["details"]) == "Bassa":
+                base_row["motivo_scarto"] = "confidence Bassa"
+
         debug_rows.append(base_row)
 
-        if best_edge is not None and best_edge >= min_edge and pair["similarity"] >= min_similarity:
+        if is_real_candidate:
             opportunity_rows.append(base_row)
 
         progress.progress(n / total, text=f"Analisi pair {n}/{total}")
@@ -589,6 +785,7 @@ with st.sidebar:
     max_pairs = st.slider("Pair candidati da analizzare", 10, 1000, 300, step=10)
     min_similarity = st.slider("Similarita\' minima matching", 0.05, 0.85, 0.15, step=0.01)
     min_edge_pct = st.number_input("Mostra solo edge netto >= %", min_value=-20.0, max_value=20.0, value=0.0, step=0.1)
+    capital_per_trade = Decimal(str(st.number_input("Capitale per trade ($)", min_value=1.0, max_value=100000.0, value=100.0, step=50.0)))
     buffer_bps = Decimal(str(st.number_input("Buffer fee/slippage, bps", min_value=0, max_value=1500, value=0, step=10)))
     read_orderbooks = st.checkbox("Leggi orderbook live", value=True)
     auto_refresh = st.checkbox("Auto-refresh 60 secondi", value=False)
@@ -628,27 +825,31 @@ with tab_scan:
             poly_sorted = sorted(poly_filtered, key=lambda m: to_float(m.get("volume24hr") or m.get("liquidity") or 0), reverse=True)[:top_poly]
             kalshi_sorted = sorted(kalshi_filtered, key=lambda m: to_float(m.get("volume") or m.get("liquidity") or 0), reverse=True)[:top_kalshi]
 
-        st.info(f"Dataset: {len(poly_sorted)} Polymarket usati su {len(poly_all)} scaricati; {len(kalshi_sorted)} Kalshi usati su {len(kalshi_all)} scaricati.")
+        st.info(f"Dataset: {len(poly_sorted)} Polymarket usati su {len(poly_all)} scaricati; {len(kalshi_sorted)} Kalshi usati su {len(kalshi_all)} validi dopo filtro anti-falsi positivi.")
         if not poly_sorted or not kalshi_sorted:
             st.warning("Pochi dati trovati. Prova filtro vuoto oppure una keyword piu' ampia: crypto, election, fed, inflation.")
         else:
             min_edge = Decimal(str(min_edge_pct)) / Decimal("100")
-            df, debug_df = scan_opportunities(poly_sorted, kalshi_sorted, min_similarity, max_pairs, buffer_bps, min_edge, read_orderbooks)
+            df, debug_df = scan_opportunities(poly_sorted, kalshi_sorted, min_similarity, max_pairs, buffer_bps, min_edge, read_orderbooks, capital_per_trade)
 
             view_cols = [
-                "edge_netto_%", "trade", "confidence", "similarity", "polymarket", "kalshi",
-                "poly_bid", "poly_ask", "kalshi_bid", "kalshi_ask", "kalshi_ticker", "status"
+                "edge_netto_%", "roi_netto_%", "profitto_stimato_$", "capitale_trade", "trade", "confidence", "similarity",
+                "polymarket", "kalshi", "poly_bid", "poly_ask", "poly_no_ask_stimato",
+                "kalshi_bid", "kalshi_ask", "kalshi_no_ask_stimato", "costo_per_contratto",
+                "profitto_per_contratto", "kalshi_ticker", "status"
             ]
 
             debug_cols = [
-                "edge_netto_%", "confidence", "similarity", "motivo_scarto", "polymarket", "kalshi",
-                "poly_bid", "poly_ask", "kalshi_bid", "kalshi_ask", "kalshi_ticker", "status", "matching_detail"
+                "edge_netto_%", "roi_netto_%", "profitto_stimato_$", "confidence", "similarity", "motivo_scarto",
+                "polymarket", "kalshi", "poly_bid", "poly_ask", "poly_no_ask_stimato",
+                "kalshi_bid", "kalshi_ask", "kalshi_no_ask_stimato", "costo_per_contratto",
+                "profitto_per_contratto", "kalshi_ticker", "status", "matching_detail"
             ]
 
             if df.empty:
                 st.warning("Nessuna opportunita' sopra i filtri impostati. Sotto trovi comunque i migliori pair candidati/debug.")
             else:
-                st.success(f"Trovate {len(df)} opportunita' candidate. Ordinate per edge netto teorico.")
+                st.success(f"Trovate {len(df)} opportunita' candidate YES+NO. Ordinate per profitto netto teorico.")
                 st.dataframe(df[view_cols], width="stretch", hide_index=True)
                 st.download_button(
                     "Scarica CSV opportunita'",
@@ -659,7 +860,7 @@ with tab_scan:
                 st.markdown("#### Link e dettagli")
                 for _, row in df.head(10).iterrows():
                     st.markdown(
-                        f"- **{row['edge_netto_%']}** | {row['confidence']} | "
+                        f"- **Profitto stimato {row.get('profitto_stimato_$', '')}** | Edge {row['edge_netto_%']} | ROI {row.get('roi_netto_%', '')} | {row['confidence']} | "
                         f"[Polymarket]({row['poly_link']}) | [Kalshi]({row['kalshi_link']}) | "
                         f"Ticker Kalshi: `{row['kalshi_ticker']}` | Token PM: `{row['poly_token_yes']}`"
                     )
@@ -704,14 +905,16 @@ with tab_poly:
 with tab_kalshi:
     st.subheader("Mercati Kalshi")
     with st.spinner("Carico Kalshi..."):
-        kalshi_all = get_kalshi_markets(kalshi_download, search)
+        kalshi_all_raw = get_kalshi_markets(kalshi_download, search)
+    kalshi_all = [m for m in kalshi_all_raw if not is_bad_kalshi_market(m)]
     kalshi_filtered = [m for m in kalshi_all if quick_filter(search, m)] if search.strip() else kalshi_all
-    st.caption(f"Mercati mostrati: {len(kalshi_filtered)} su {len(kalshi_all)} scaricati. Filtro: {search or 'nessuno'}")
+    st.caption(f"Mercati mostrati: {len(kalshi_filtered)} su {len(kalshi_all)} validi; {len(kalshi_all_raw)} scaricati totali. Filtro: {search or 'nessuno'}")
     rows = []
     for m in kalshi_filtered[:500]:
         bid, ask = best_kalshi_prices_from_market(m)
         rows.append({
             "ticker": m.get("ticker"),
+            "question_leggibile": kalshi_display_question(m),
             "title": m.get("title"),
             "subtitle": m.get("subtitle"),
             "yes_bid": fmt_price(bid),
@@ -777,14 +980,22 @@ with tab_help:
     st.subheader("Come leggere i risultati")
     st.markdown(
         """
-**Edge netto** = differenza tra prezzo di vendita e prezzo di acquisto, meno il buffer fee/slippage impostato.
+**Edge netto** = nella tabella principale e' il profitto netto teorico per contratto usando la logica YES+NO.
+
+**Profitto stimato** = capitale per trade / costo per contratto * profitto per contratto.
+
+**Trade YES+NO**:
+- Compra YES Polymarket + compra NO Kalshi
+- oppure compra YES Kalshi + compra NO Polymarket
+
+NO ask e' stimato come `1 - YES bid` dell'altra piattaforma.
 
 **Confidence** non garantisce che il mercato sia identico. Indica solo quanto i testi sembrano simili:
 - **Alta**: candidato buono, ma da verificare comunque.
 - **Media**: possibile, attenzione al wording.
 - **Bassa**: spesso falso positivo.
 
-**Regola pratica:** prima di mettere soldi, apri entrambi i link e controlla manualmente:
+**Regola pratica:** ignora qualsiasi riga con confidence Bassa o prezzi 0.0000. Prima di mettere soldi, apri entrambi i link e controlla manualmente:
 1. stesso evento;
 2. stessa data/ora di settlement;
 3. stessa soglia numerica;
