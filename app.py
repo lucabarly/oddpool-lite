@@ -17,7 +17,7 @@ KALSHI_BASE_ALT = "https://external-api.kalshi.com/trade-api/v2"
 
 st.set_page_config(page_title="Oddpool Lite Scanner", layout="wide")
 st.title("Oddpool Lite - Scanner automatico opportunita'")
-st.caption("Versione aggiornata: matching strutturato strict + profitto YES+NO")
+st.caption("Versione aggiornata: debug pulito + matching strutturato strict + profitto YES+NO")
 st.caption(
     "Scanner gratuito Polymarket/Kalshi: trova mercati simili, legge top-of-book e calcola edge teorico. "
     "Non e' consulenza finanziaria e non esegue trade automatici."
@@ -317,8 +317,20 @@ def extract_teams(s: str) -> set:
 
 
 def has_any_phrase(s: str, phrases: set) -> bool:
+    """
+    Matching sicuro per parole/phrase.
+    Evita falsi match tipo token corti dentro parole non correlate.
+    """
     s = canonical_text_for_rules(s)
-    return any(p in s for p in phrases)
+    for p in phrases:
+        p = canonical_text_for_rules(str(p))
+        if " " in p:
+            if p in s:
+                return True
+        else:
+            if re.search(r"\\b" + re.escape(p) + r"\\b", s):
+                return True
+    return False
 
 
 def is_over_under_market(s: str) -> bool:
@@ -333,12 +345,16 @@ def is_draw_market(s: str) -> bool:
 
 def market_family_from_text(s: str) -> str:
     stxt = canonical_text_for_rules(s)
-    if has_any_phrase(stxt, CRYPTO_WORDS):
+
+    if re.search(r"\\b(bitcoin|btc|ethereum|eth|solana|sol|crypto)\\b", stxt):
         return "crypto"
+
     if has_any_phrase(stxt, MACRO_WORDS):
         return "macro"
+
     if has_any_phrase(stxt, SPORT_WORDS) or bool(extract_teams(stxt)):
         return "sport"
+
     return "other"
 
 
@@ -784,18 +800,20 @@ def scan_opportunities(
     read_orderbooks: bool,
     capital_per_trade: Decimal,
     matching_mode: str,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Ritorna due tabelle:
-    - opportunita': solo pair con edge >= filtro e similarita' sopra soglia;
-    - debug: tutti i pair analizzati, inclusi quelli scartati, con motivo.
+    Ritorna tre tabelle:
+    - opportunita': solo pair validi con edge >= filtro;
+    - debug: solo pair strutturalmente compatibili;
+    - rejected: pair scartati per famiglia/squadra/soglia/data o bundle Kalshi.
     """
     pairs = candidate_pairs(poly_markets, kalshi_markets, min_similarity, max_pairs)
     opportunity_rows = []
     debug_rows = []
+    rejected_rows = []
 
     if not pairs:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     progress = st.progress(0, text="Analisi pair candidati...")
     total = max(1, len(pairs))
@@ -955,7 +973,10 @@ def scan_opportunities(
             elif confidence(pair["similarity"], pair["details"]) == "Bassa":
                 base_row["motivo_scarto"] = "confidence Bassa"
 
-        debug_rows.append(base_row)
+        if structured_ok:
+            debug_rows.append(base_row)
+        else:
+            rejected_rows.append(base_row)
 
         if is_real_candidate:
             opportunity_rows.append(base_row)
@@ -967,6 +988,7 @@ def scan_opportunities(
 
     opp_df = pd.DataFrame(opportunity_rows)
     debug_df = pd.DataFrame(debug_rows)
+    rejected_df = pd.DataFrame(rejected_rows)
 
     if not opp_df.empty:
         opp_df = opp_df.sort_values(["edge_netto", "similarity"], ascending=[False, False], na_position="last")
@@ -974,7 +996,10 @@ def scan_opportunities(
     if not debug_df.empty:
         debug_df = debug_df.sort_values(["edge_netto", "similarity"], ascending=[False, False], na_position="last")
 
-    return opp_df, debug_df
+    if not rejected_df.empty:
+        rejected_df = rejected_df.sort_values(["similarity"], ascending=[False], na_position="last")
+
+    return opp_df, debug_df, rejected_df
 
 
 # -----------------------------
@@ -1037,7 +1062,7 @@ with tab_scan:
             st.warning("Pochi dati trovati. Prova filtro vuoto oppure una keyword piu' ampia: crypto, election, fed, inflation.")
         else:
             min_edge = Decimal(str(min_edge_pct)) / Decimal("100")
-            df, debug_df = scan_opportunities(poly_sorted, kalshi_sorted, min_similarity, max_pairs, buffer_bps, min_edge, read_orderbooks, capital_per_trade, matching_mode)
+            df, debug_df, rejected_df = scan_opportunities(poly_sorted, kalshi_sorted, min_similarity, max_pairs, buffer_bps, min_edge, read_orderbooks, capital_per_trade, matching_mode)
 
             view_cols = [
                 "edge_netto_%", "roi_netto_%", "profitto_stimato_$", "capitale_trade", "trade", "confidence", "similarity",
@@ -1073,20 +1098,38 @@ with tab_scan:
                         f"Ticker Kalshi: `{row['kalshi_ticker']}` | Token PM: `{row['poly_token_yes']}`"
                     )
 
-            st.markdown("### Debug matching - migliori pair analizzati")
+            st.markdown("### Debug matching pulito - solo pair strutturalmente compatibili")
             st.caption(
-                "Questa tabella mostra anche i pair scartati. Serve per capire se il problema e' matching, orderbook, prezzi o edge sotto filtro."
+                "Qui vedi solo pair che passano i controlli di famiglia mercato, squadra/data/soglia e anti-bundle Kalshi."
             )
             if debug_df.empty:
-                st.info("Nessun pair candidato generato. Abbassa la similarita' minima o aumenta i mercati analizzati.")
+                st.info("Nessun pair strutturalmente compatibile generato. Prova una keyword piu' specifica oppure cambia modalita'.")
             else:
                 st.dataframe(debug_df[debug_cols], width="stretch", hide_index=True)
                 st.download_button(
-                    "Scarica CSV debug matching",
+                    "Scarica CSV debug matching pulito",
                     debug_df.to_csv(index=False).encode("utf-8"),
-                    file_name="oddpool_lite_debug_matching.csv",
+                    file_name="oddpool_lite_debug_matching_pulito.csv",
                     mime="text/csv",
                 )
+
+            with st.expander("Pair scartati - solo per diagnosi"):
+                st.caption("Questi sono i confronti respinti. Non usarli come opportunita'.")
+                if rejected_df.empty:
+                    st.info("Nessun pair scartato.")
+                else:
+                    rejected_cols = [
+                        "motivo_scarto", "structured_reason", "market_family_poly", "market_family_kalshi",
+                        "similarity", "polymarket", "kalshi", "kalshi_ticker", "matching_detail"
+                    ]
+                    available_rejected_cols = [c for c in rejected_cols if c in rejected_df.columns]
+                    st.dataframe(rejected_df[available_rejected_cols].head(300), width="stretch", hide_index=True)
+                    st.download_button(
+                        "Scarica CSV pair scartati",
+                        rejected_df.to_csv(index=False).encode("utf-8"),
+                        file_name="oddpool_lite_pair_scartati.csv",
+                        mime="text/csv",
+                    )
 
 with tab_poly:
     st.subheader("Mercati Polymarket")
