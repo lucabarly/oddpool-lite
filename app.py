@@ -17,7 +17,7 @@ KALSHI_BASE_ALT = "https://external-api.kalshi.com/trade-api/v2"
 
 st.set_page_config(page_title="Oddpool Lite Scanner", layout="wide")
 st.title("Oddpool Lite - Scanner automatico opportunita'")
-st.caption("Versione aggiornata: Kalshi single-market only + Polymarket pagination fix")
+st.caption("Versione aggiornata: hotfix kalshi_removed + Kalshi single-market only")
 st.caption(
     "Scanner gratuito Polymarket/Kalshi: trova mercati simili, legge top-of-book e calcola edge teorico. "
     "Non e' consulenza finanziaria e non esegue trade automatici."
@@ -1132,6 +1132,7 @@ with tab_scan:
     st.info("Nuova logica: Kalshi single-market only. I bundle/multi-event vengono scartati prima del matching.")
 
     if st.button("Avvia scanner", type="primary"):
+        kalshi_removed = 0
         with st.spinner("Scarico mercati Polymarket e Kalshi..."):
             poly_all = get_polymarket_markets(search, poly_download)
             kalshi_all = get_kalshi_markets(kalshi_download, "")
