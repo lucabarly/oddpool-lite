@@ -1,544 +1,70 @@
-import json
+import os
 import re
+import json
 import time
-from decimal import Decimal, InvalidOperation
-from difflib import SequenceMatcher
+from decimal import Decimal
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus
 
 import pandas as pd
 import requests
 import streamlit as st
 
+
+# ============================================================
+# PolyEdge Scanner
+# Polymarket + bookmaker odds benchmark via The Odds API
+# ============================================================
+
+APP_VERSION = "PolyEdge Scanner v1 - Polymarket + The Odds API benchmark"
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
-KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KALSHI_BASE_ALT = "https://external-api.kalshi.com/trade-api/v2"
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
-st.set_page_config(page_title="Oddpool Lite Scanner", layout="wide")
-st.title("Oddpool Lite - Scanner automatico opportunita'")
-st.caption("Versione aggiornata: progress percentuale + modalita veloce + Kalshi single-market only")
-st.caption(
-    "Scanner gratuito Polymarket/Kalshi: trova mercati simili, legge top-of-book e calcola edge teorico. "
-    "Non e' consulenza finanziaria e non esegue trade automatici."
+st.set_page_config(
+    page_title="PolyEdge Scanner",
+    page_icon="📊",
+    layout="wide",
 )
 
-# -----------------------------
-# Utility
-# -----------------------------
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "PolyEdgeScanner/1.0"})
 
-def dec(value: Any, default: str = "0") -> Decimal:
+
+# ============================================================
+# Generic helpers
+# ============================================================
+
+def get_secret_or_env(name: str, default: str = "") -> str:
     try:
-        if value is None or value == "":
-            return Decimal(default)
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return Decimal(default)
-
-
-def to_float(value: Any) -> float:
-    try:
-        if value is None or value == "":
-            return 0.0
-        return float(value)
+        if name in st.secrets:
+            return str(st.secrets[name])
     except Exception:
-        return 0.0
+        pass
+    return os.environ.get(name, default)
 
 
-def price_to_decimal(value: Any) -> Optional[Decimal]:
-    """Normalize prices returned as dollars (0.42), cents (42), or fixed point (4200)."""
-    if value is None or value == "":
-        return None
-    x = dec(value)
-    if x > 100:
-        return x / Decimal("10000")
-    if x > 1:
-        return x / Decimal("100")
-    return x
-
-
-def parse_json_list(value: Any) -> List[str]:
-    if isinstance(value, list):
-        return [str(x) for x in value]
-    if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return []
-        try:
-            parsed = json.loads(s)
-            if isinstance(parsed, list):
-                return [str(x) for x in parsed]
-        except Exception:
-            pass
-        if "," in s:
-            return [x.strip().strip('"') for x in s.split(",") if x.strip()]
-        return [s.strip('"')]
-    return []
-
-
-def text_of_market(m: Dict[str, Any]) -> str:
-    fields = [
-        m.get("question"), m.get("title"), m.get("eventTitle"), m.get("subtitle"),
-        m.get("slug"), m.get("description"), m.get("category"), m.get("ticker"),
-        m.get("event_ticker"), m.get("series_ticker"),
-    ]
-    return " ".join(str(x or "") for x in fields)
-
-
-def normalize_text(s: str) -> str:
-    s = s.lower()
-    repl = {
-        "$": " dollars ", "%": " percent ", "&": " and ",
-        "btc": " bitcoin ", "eth": " ethereum ", "sol": " solana ",
-        "fed": " federal reserve ", "cpi": " inflation cpi ",
-        "election": " election ", "trump": " trump ", "biden": " biden ",
-    }
-    for k, v in repl.items():
-        s = s.replace(k, v)
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-STOPWORDS = set("""
-will the a an and or of in on by before after at to for with from is are be this that which who what when where above below over under yes no market markets contract event outcome resolve resolves resolution
-""".split())
-
-
-def keywords(s: str) -> set:
-    s = normalize_text(s)
-    words = [w for w in s.split() if len(w) >= 3 and w not in STOPWORDS]
-    return set(words)
-
-
-def important_numbers(s: str) -> set:
-    return set(re.findall(r"\b\d+(?:\.\d+)?\b", s.lower()))
-
-
-def similarity(a: str, b: str) -> Tuple[float, Dict[str, Any]]:
-    an = normalize_text(a)
-    bn = normalize_text(b)
-    seq = SequenceMatcher(None, an, bn).ratio()
-    ka = keywords(an)
-    kb = keywords(bn)
-    overlap = len(ka & kb) / max(1, len(ka | kb))
-    nums_a = important_numbers(an)
-    nums_b = important_numbers(bn)
-    nums_match = 1.0 if (not nums_a or not nums_b or bool(nums_a & nums_b)) else 0.0
-    score = 0.50 * overlap + 0.35 * seq + 0.15 * nums_match
-    detail = {"seq": round(seq, 3), "keyword_overlap": round(overlap, 3), "numbers_match": nums_match}
-    return score, detail
-
-
-def confidence(score: float, details: Dict[str, Any]) -> str:
-    if score >= 0.62 and details.get("numbers_match", 1) == 1:
-        return "Alta"
-    if score >= 0.48:
-        return "Media"
-    return "Bassa"
-
-
-def dedupe(items: List[Dict[str, Any]], key_fields: List[str]) -> List[Dict[str, Any]]:
-    seen = set()
-    out = []
-    for item in items:
-        key = None
-        for f in key_fields:
-            if item.get(f):
-                key = str(item.get(f))
-                break
-        if not key:
-            key = text_of_market(item)[:120]
-        if key not in seen:
-            seen.add(key)
-            out.append(item)
-    return out
-
-
-def market_link_poly(m: Dict[str, Any]) -> str:
-    slug = m.get("slug") or m.get("eventSlug") or ""
-    if slug:
-        return f"https://polymarket.com/event/{slug}"
-    q = quote_plus(str(m.get("question") or m.get("title") or ""))
-    return f"https://polymarket.com/search?query={q}"
-
-
-def market_link_kalshi(m: Dict[str, Any]) -> str:
-    ticker = m.get("ticker") or ""
-    if ticker:
-        return f"https://kalshi.com/markets/{ticker}"
-    q = quote_plus(str(m.get("title") or ""))
-    return f"https://kalshi.com/search?query={q}"
-
-
-def is_bad_kalshi_market(m: Dict[str, Any]) -> bool:
-    """
-    Esclude mercati Kalshi che generano moltissimi falsi positivi:
-    - multi-game sport extensions;
-    - cross-category bundles;
-    - titoli troppo lunghi con molti outcome separati da virgole.
-    """
-    ticker = str(m.get("ticker") or "").upper()
-    title = str(m.get("title") or "")
-    subtitle = str(m.get("subtitle") or "")
-    text = f"{title} {subtitle}".lower()
-
-    bad_ticker_parts = [
-        "MULTIGAME",
-        "CROSSCATEGORY",
-        "MULTI",
-        "PARLAY",
-    ]
-
-    if any(x in ticker for x in bad_ticker_parts):
-        return True
-
-    if text.count(",") >= 3:
-        return True
-
-    if len(text.split()) > 35:
-        return True
-
-    return False
-
-
-def valid_price_pair(bid: Optional[Decimal], ask: Optional[Decimal]) -> bool:
-    """
-    Prezzi 0.0000 su Kalshi spesso indicano assenza di book/contratto non realmente tradabile.
-    Per le opportunita' vogliamo prezzi strettamente dentro (0, 1).
-    """
-    if bid is None or ask is None:
-        return False
-    if bid <= 0 or ask <= 0:
-        return False
-    if bid >= 1 or ask >= 1:
-        return False
-    if bid > ask:
-        return False
-    return True
-
-
-def kalshi_display_question(m: Dict[str, Any]) -> str:
-    """
-    Kalshi spesso non ha una singola 'question' pulita come Polymarket.
-    Questa funzione ricostruisce una descrizione leggibile usando i campi disponibili.
-    """
-    parts = []
-    for key in [
-        "event_title", "eventTitle", "series_title", "seriesTitle",
-        "title", "subtitle", "yes_sub_title", "no_sub_title"
-    ]:
-        v = m.get(key)
-        if v and str(v).strip():
-            s = str(v).strip()
-            if s not in parts:
-                parts.append(s)
-
-    if not parts:
-        return str(m.get("ticker") or "")
-
-    return " | ".join(parts[:4])
-
-
-def kalshi_matching_text(m: Dict[str, Any]) -> str:
-    """
-    Testo usato per il matching. Evita di usare solo titoli tecnici poco leggibili.
-    """
-    fields = [
-        m.get("event_title"), m.get("eventTitle"), m.get("series_title"), m.get("seriesTitle"),
-        m.get("title"), m.get("subtitle"), m.get("yes_sub_title"), m.get("no_sub_title"),
-        m.get("category"), m.get("ticker"), m.get("event_ticker"), m.get("series_ticker"),
-    ]
-    return " ".join(str(x or "") for x in fields)
-
-
-TEAM_ALIASES = {
-    "usa": "united states",
-    "us": "united states",
-    "united states": "united states",
-    "korea republic": "south korea",
-    "republic of korea": "south korea",
-    "south korea": "south korea",
-    "turkiye": "turkey",
-    "turkey": "turkey",
-    "ivory coast": "cote d ivoire",
-    "cote d ivoire": "cote d ivoire",
-    "dr congo": "congo dr",
-    "congo dr": "congo dr",
-    "bosnia herzegovina": "bosnia and herzegovina",
-    "bosnia and herzegovina": "bosnia and herzegovina",
-}
-
-COMMON_TEAMS = {
-    "argentina", "australia", "austria", "belgium", "brazil", "canada", "chile",
-    "colombia", "croatia", "ecuador", "egypt", "england", "france", "germany",
-    "ghana", "haiti", "iran", "iraq", "italy", "japan", "mexico", "morocco",
-    "netherlands", "norway", "paraguay", "portugal", "qatar", "scotland",
-    "senegal", "spain", "sweden", "switzerland", "tunisia", "turkey",
-    "united states", "uruguay", "south korea", "new zealand", "cape verde",
-    "algeria", "jordan", "panama", "curacao", "czechia", "south africa",
-    "congo dr", "cote d ivoire", "uzbekistan",
-    "atlanta", "baltimore", "chicago", "detroit", "houston", "indiana",
-    "los angeles", "miami", "milwaukee", "new york", "philadelphia",
-    "san francisco", "seattle", "tampa bay", "texas", "washington",
-}
-
-SPORT_WORDS = {
-    "vs", "win", "wins", "winner", "draw", "tie", "spread", "over", "under",
-    "goals", "runs", "points", "world cup", "fifa", "mlb", "nba", "wnba",
-    "tennis", "soccer", "football", "baseball", "basketball",
-}
-
-CRYPTO_WORDS = {"bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto"}
-MACRO_WORDS = {"fed", "federal reserve", "interest rates", "cpi", "inflation", "rate", "rates"}
-
-
-def canonical_text_for_rules(s: str) -> str:
-    s = normalize_text(s)
-    for k, v in TEAM_ALIASES.items():
-        s = s.replace(k, v)
+def normalize_text(s: Any) -> str:
+    s = str(s or "").lower()
+    s = s.replace("&", " and ")
+    s = re.sub(r"[^a-z0-9\.\-\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def extract_dates(s: str) -> set:
-    s = s.lower()
-    dates = set(re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", s))
-    dates.update(re.findall(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:,\s*20\d{2})?\b", s))
-    dates.update(re.findall(r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:,\s*20\d{2})?\b", s))
-    return dates
+def dec(x: Any, default: str = "0") -> Decimal:
+    try:
+        if x is None or x == "":
+            return Decimal(default)
+        return Decimal(str(x))
+    except Exception:
+        return Decimal(default)
 
 
-def extract_teams(s: str) -> set:
-    s = canonical_text_for_rules(s)
-    found = set()
-    for team in COMMON_TEAMS:
-        if re.search(r"\b" + re.escape(team) + r"\b", s):
-            found.add(team)
-    return found
-
-
-def has_any_phrase(s: str, phrases: set) -> bool:
-    """
-    Matching sicuro per parole/phrase.
-    Evita falsi match tipo token corti dentro parole non correlate.
-    """
-    s = canonical_text_for_rules(s)
-    for p in phrases:
-        p = canonical_text_for_rules(str(p))
-        if " " in p:
-            if p in s:
-                return True
-        else:
-            if re.search(r"\b" + re.escape(p) + r"\b", s):
-                return True
-    return False
-
-
-def is_over_under_market(s: str) -> bool:
-    s = canonical_text_for_rules(s)
-    return ("over" in s or "under" in s or "o u" in s) and bool(important_numbers(s))
-
-
-def is_draw_market(s: str) -> bool:
-    s = canonical_text_for_rules(s)
-    return bool(re.search(r"\b(draw|tie)\b", s))
-
-
-def market_family_from_text(s: str) -> str:
-    stxt = canonical_text_for_rules(s)
-
-    if re.search(r"\b(bitcoin|btc|ethereum|eth|solana|sol|crypto)\b", stxt):
-        return "crypto"
-
-    if has_any_phrase(stxt, MACRO_WORDS):
-        return "macro"
-
-    if has_any_phrase(stxt, SPORT_WORDS) or bool(extract_teams(stxt)):
-        return "sport"
-
-    return "other"
-
-
-def is_strictly_bad_kalshi(m: Dict[str, Any]) -> bool:
-    """
-    Filtro aggressivo: accetta solo mercati Kalshi che sembrano single-market.
-    Esclude bundle, multi-event, cross-category, liste di outcome e ticker sport multi-game.
-    """
-    ticker = str(m.get("ticker") or "").upper()
-    series = str(m.get("series_ticker") or "").upper()
-    event = str(m.get("event_ticker") or "").upper()
-
-    title = str(m.get("title") or "")
-    subtitle = str(m.get("subtitle") or "")
-    yes_sub = str(m.get("yes_sub_title") or "")
-    no_sub = str(m.get("no_sub_title") or "")
-    display = kalshi_display_question(m)
-
-    txt = f"{title} {subtitle} {yes_sub} {no_sub} {display}".lower()
-    joined_tickers = " ".join([ticker, series, event])
-
-    hard_bad_ticker_parts = [
-        "MULTIGAME",
-        "CROSSCATEGORY",
-        "CROSS_CATEGORY",
-        "PARLAY",
-        "COMBO",
-        "BUNDLE",
-        "KXMVECROSSCATEGORY",
-        "KXMVESPORTSMULTIGAME",
-        "KXMVEMULTIGAME",
-    ]
-
-    if any(x in joined_tickers for x in hard_bad_ticker_parts):
-        return True
-
-    # Kalshi bundle spesso appare come: "yes Brazil,yes USA,yes Tie..."
-    compact = re.sub(r"\s+", " ", txt).strip()
-
-    if compact.count(",") >= 1 and len(re.findall(r"\b(yes|no)\b", compact)) >= 2:
-        return True
-
-    if len(re.findall(r"\b(yes|no)\b", compact)) >= 3:
-        return True
-
-    # Titoli con molte virgole sono quasi sempre liste di outcome.
-    if compact.count(",") >= 2:
-        return True
-
-    # Troppi separatori verticali indicano composizione di campi multipli molto rumorosa.
-    if display.count("|") >= 4:
-        return True
-
-    # Troppi team noti nello stesso mercato = probabile multi-event.
-    teams = extract_teams(compact)
-    if len(teams) >= 4:
-        return True
-
-    # Se ci sono molte parole "wins by / over" ripetute, e' quasi sempre un builder/bundle.
-    repeated_market_terms = len(re.findall(r"\b(wins by|over|under|both teams to score|tie)\b", compact))
-    if repeated_market_terms >= 4:
-        return True
-
-    # Titoli troppo lunghi: spesso aggregati multi-event.
-    if len(compact.split()) > 28:
-        return True
-
-    return False
-
-
-def kalshi_single_market_reason(m: Dict[str, Any]) -> str:
-    ticker = str(m.get("ticker") or "").upper()
-    title = str(m.get("title") or "")
-    display = kalshi_display_question(m)
-    txt = f"{title} {display}".lower()
-
-    if any(x in ticker for x in ["MULTIGAME", "CROSSCATEGORY", "CROSS_CATEGORY", "PARLAY", "COMBO", "BUNDLE"]):
-        return "ticker Kalshi multi/bundle"
-
-    if txt.count(",") >= 1 and len(re.findall(r"\b(yes|no)\b", txt)) >= 2:
-        return "lista outcome yes/no"
-
-    if len(re.findall(r"\b(yes|no)\b", txt)) >= 3:
-        return "troppi outcome yes/no"
-
-    if len(extract_teams(txt)) >= 4:
-        return "troppi team nello stesso mercato"
-
-    if txt.count(",") >= 2:
-        return "troppe virgole/lista outcome"
-
-    if len(txt.split()) > 28:
-        return "titolo Kalshi troppo lungo"
-
-    return "Kalshi non single-market"
-
-
-def structured_pair_ok(pm: Dict[str, Any], km: Dict[str, Any], mode: str) -> Tuple[bool, str]:
-    if is_strictly_bad_kalshi(km) or is_bad_kalshi_market(km):
-        return False, kalshi_single_market_reason(km)
-
-    ptxt = text_of_market(pm)
-    ktxt = kalshi_matching_text(km)
-    pnorm = canonical_text_for_rules(ptxt)
-    knorm = canonical_text_for_rules(ktxt)
-
-    p_family = market_family_from_text(pnorm)
-    k_family = market_family_from_text(knorm)
-
-    if mode != "Auto strict":
-        wanted = {
-            "Sport strict": "sport",
-            "Crypto strict": "crypto",
-            "Macro/Fed strict": "macro",
-        }.get(mode)
-        if wanted and (p_family != wanted or k_family != wanted):
-            return False, f"famiglia diversa da {wanted}"
-
-    if p_family != k_family:
-        return False, f"famiglia diversa ({p_family} vs {k_family})"
-
-    pnums = important_numbers(pnorm)
-    knums = important_numbers(knorm)
-    if pnums and knums and not (pnums & knums):
-        return False, "soglia/numero diverso"
-
-    pdates = extract_dates(pnorm)
-    kdates = extract_dates(knorm)
-    if pdates and kdates and not (pdates & kdates):
-        return False, "data diversa"
-
-    pteams = extract_teams(pnorm)
-    kteams = extract_teams(knorm)
-
-    if p_family == "sport":
-        if pteams or kteams:
-            common_teams = pteams & kteams
-            if not common_teams:
-                return False, "squadra/player non coincidente"
-
-        if is_over_under_market(pnorm) or is_over_under_market(knorm):
-            if not (is_over_under_market(pnorm) and is_over_under_market(knorm)):
-                return False, "tipo mercato diverso: over/under"
-            if pnums and knums and not (pnums & knums):
-                return False, "linea over/under diversa"
-
-        if is_draw_market(pnorm) or is_draw_market(knorm):
-            if not (is_draw_market(pnorm) and is_draw_market(knorm)):
-                return False, "draw/tie non equivalente"
-
-    if p_family == "crypto":
-        assets = ["bitcoin", "ethereum", "solana"]
-        common_assets = [a for a in assets if a in pnorm and a in knorm]
-        if not common_assets:
-            return False, "asset crypto diverso"
-        if pnums and knums and not (pnums & knums):
-            return False, "soglia prezzo crypto diversa"
-
-    if p_family == "macro":
-        pk = keywords(pnorm)
-        kk = keywords(knorm)
-        overlap = pk & kk
-        if len(overlap) < 2:
-            return False, "macro keywords insufficienti"
-
-    pk = keywords(pnorm)
-    kk = keywords(knorm)
-    strong_overlap = (pk & kk) - STOPWORDS
-    if len(strong_overlap) < 2 and not (pteams & kteams):
-        return False, "keyword forti insufficienti"
-
-    return True, "ok strutturato"
-
-
-def no_ask_from_yes_bid(yes_bid: Optional[Decimal]) -> Optional[Decimal]:
-    if yes_bid is None:
-        return None
-    return Decimal("1") - yes_bid
-
-
-def estimated_contracts_from_capital(capital: Decimal, cost_per_contract: Optional[Decimal]) -> Optional[Decimal]:
-    if cost_per_contract is None or cost_per_contract <= 0:
-        return None
-    return capital / cost_per_contract
+def fmt_pct(x: Optional[Decimal]) -> str:
+    if x is None:
+        return ""
+    return f"{float(x) * 100:.2f}%"
 
 
 def fmt_money(x: Optional[Decimal]) -> str:
@@ -547,102 +73,171 @@ def fmt_money(x: Optional[Decimal]) -> str:
     return f"${float(x):,.2f}"
 
 
-def fmt_decimal(x: Optional[Decimal]) -> str:
+def fmt_price(x: Optional[Decimal]) -> str:
     if x is None:
         return ""
-    return f"{float(x):,.2f}"
+    return f"{float(x):.4f}"
 
 
-def arbitrage_yes_no(
-    yes_ask: Optional[Decimal],
-    opposite_yes_bid: Optional[Decimal],
-    buffer_bps: Decimal,
-) -> Tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
-    """
-    Compra YES su una piattaforma + compra NO sull'altra.
-    NO ask viene stimato come 1 - YES bid dell'altra piattaforma.
-    Ritorna: costo netto per contratto, profitto netto per contratto, ROI netto.
-    """
-    no_ask = no_ask_from_yes_bid(opposite_yes_bid)
-
-    if yes_ask is None or no_ask is None:
-        return None, None, None
-    if yes_ask <= 0 or no_ask <= 0 or yes_ask >= 1 or no_ask >= 1:
-        return None, None, None
-
-    gross_cost = yes_ask + no_ask
-    buffer_cost = gross_cost * buffer_bps / Decimal("10000")
-    net_cost = gross_cost + buffer_cost
-    profit = Decimal("1") - net_cost
-    roi = profit / net_cost if net_cost > 0 else None
-    return net_cost, profit, roi
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-# -----------------------------
-# Data fetchers
-# -----------------------------
+def short_time(iso_time: str) -> str:
+    try:
+        dt = datetime.fromisoformat(str(iso_time).replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return str(iso_time or "")
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_polymarket_markets(query: str = "", max_download: int = 3000) -> List[Dict[str, Any]]:
-    session = requests.Session()
-    results: List[Dict[str, Any]] = []
-    q = query.strip()
 
-    if q:
-        for key in ["search", "q", "query"]:
-            for endpoint in ["markets", "events"]:
-                try:
-                    params = {key: q, "active": "true", "closed": "false", "limit": 500}
-                    r = session.get(f"{POLY_GAMMA}/{endpoint}", params=params, timeout=15)
-                    if not r.ok:
-                        continue
-                    data = r.json()
-                    items = data if isinstance(data, list) else data.get(endpoint, [])
-                    if endpoint == "markets":
-                        results.extend([x for x in items if isinstance(x, dict)])
-                    else:
-                        for ev in items:
-                            if not isinstance(ev, dict):
-                                continue
-                            for m in ev.get("markets", []) or []:
-                                if isinstance(m, dict):
-                                    m = dict(m)
-                                    m.setdefault("eventTitle", ev.get("title") or ev.get("slug"))
-                                    m.setdefault("eventSlug", ev.get("slug"))
-                                    results.append(m)
-                except Exception:
-                    pass
+def implied_prob_from_decimal_odds(odds: Decimal) -> Optional[Decimal]:
+    if odds <= 0:
+        return None
+    return Decimal("1") / odds
 
-    # Gamma API spesso limita le risposte a 100 mercati per pagina anche se chiediamo di piu'.
-    # Per questo usiamo page_size=100 e paginiamo finche' raggiungiamo max_download.
+
+def safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None or x == "":
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def round_down_money(x: Decimal) -> Decimal:
+    return x.quantize(Decimal("0.01"))
+
+
+def market_link_poly(m: Dict[str, Any]) -> str:
+    slug = m.get("slug") or m.get("marketSlug")
+    if slug:
+        return f"https://polymarket.com/market/{slug}"
+    return "https://polymarket.com"
+
+
+# ============================================================
+# Team normalization
+# ============================================================
+
+TEAM_ALIASES = {
+    "man utd": "manchester united",
+    "man united": "manchester united",
+    "man city": "manchester city",
+    "spurs": "tottenham",
+    "tottenham hotspur": "tottenham",
+    "inter milan": "inter",
+    "internazionale": "inter",
+    "ac milan": "milan",
+    "ny yankees": "new york yankees",
+    "new york y": "new york yankees",
+    "la dodgers": "los angeles dodgers",
+    "los angeles d": "los angeles dodgers",
+    "sf giants": "san francisco giants",
+    "kc chiefs": "kansas city chiefs",
+    "tb buccaneers": "tampa bay buccaneers",
+    "gb packers": "green bay packers",
+    "usa": "united states",
+    "us": "united states",
+    "turkiye": "turkey",
+    "korea republic": "south korea",
+    "republic of korea": "south korea",
+}
+
+
+def canonical(s: Any) -> str:
+    text = normalize_text(s)
+    for k, v in TEAM_ALIASES.items():
+        text = re.sub(r"\b" + re.escape(k) + r"\b", v, text)
+    return text
+
+
+def words_set(s: Any) -> set:
+    return set([w for w in canonical(s).split() if len(w) > 2])
+
+
+def text_similarity(a: str, b: str) -> Decimal:
+    aw = words_set(a)
+    bw = words_set(b)
+    if not aw or not bw:
+        return Decimal("0")
+    inter = aw & bw
+    union = aw | bw
+    return Decimal(len(inter)) / Decimal(len(union))
+
+
+def contains_phrase(text: str, phrase: str) -> bool:
+    return re.search(r"\b" + re.escape(canonical(phrase)) + r"\b", canonical(text)) is not None
+
+
+def outcome_side_from_poly_question(question: str, home: str, away: str) -> Optional[str]:
+    q = canonical(question)
+    h = canonical(home)
+    a = canonical(away)
+
+    if contains_phrase(q, h):
+        return home
+    if contains_phrase(q, a):
+        return away
+
+    return None
+
+
+def extract_total_line(question: str) -> Optional[Decimal]:
+    q = canonical(question)
+    m = re.search(r"\b(?:over|under|o/u|total)\s*([0-9]+(?:\.[0-9]+)?)\b", q)
+    if m:
+        return dec(m.group(1), "0")
+    m = re.search(r"\b([0-9]+(?:\.[0-9]+)?)\s*(?:goals|runs|points)\b", q)
+    if m:
+        return dec(m.group(1), "0")
+    return None
+
+
+def poly_market_type(question: str) -> str:
+    q = canonical(question)
+    if "over" in q or "under" in q or "o u" in q or "total" in q:
+        return "totals"
+    if "spread" in q or "handicap" in q:
+        return "spreads"
+    if "win" in q or "winner" in q or "beat" in q:
+        return "h2h"
+    return "unknown"
+
+
+# ============================================================
+# Polymarket APIs
+# ============================================================
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_polymarket_markets(max_download: int, query: str = "") -> Tuple[List[Dict[str, Any]], str]:
+    results = []
     page_size = 100
     offset = 0
-    empty_pages = 0
 
     while len(results) < max_download:
+        params = {
+            "limit": min(page_size, max_download - len(results)),
+            "offset": offset,
+            "active": "true",
+            "closed": "false",
+            "order": "volume24hr",
+            "ascending": "false",
+        }
+
+        if query.strip():
+            params["q"] = query.strip()
+
         try:
-            params = {
-                "limit": min(page_size, max_download - len(results)),
-                "offset": offset,
-                "active": "true",
-                "closed": "false",
-                "order": "volume24hr",
-                "ascending": "false",
-            }
-
-            r = session.get(f"{POLY_GAMMA}/markets", params=params, timeout=20)
+            r = SESSION.get(f"{POLY_GAMMA}/markets", params=params, timeout=20)
             r.raise_for_status()
-
             data = r.json()
             batch = data if isinstance(data, list) else data.get("markets", [])
             batch = [x for x in batch if isinstance(x, dict)]
 
             if not batch:
-                empty_pages += 1
-                if empty_pages >= 2:
-                    break
-                offset += page_size
-                continue
+                break
 
             results.extend(batch)
             offset += len(batch)
@@ -650,790 +245,843 @@ def get_polymarket_markets(query: str = "", max_download: int = 3000) -> List[Di
             if len(batch) < page_size:
                 break
 
-        except Exception:
-            break
-
-    return dedupe(results, ["id", "conditionId", "question", "slug"])
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_kalshi_markets(max_download: int = 1000, search: str = "") -> List[Dict[str, Any]]:
-    session = requests.Session()
-    base_urls = [KALSHI_BASE, KALSHI_BASE_ALT]
-
-    def download_from_base(base_url: str, params_extra: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
-        cursor = None
-
-        while len(results) < max_download:
-            params = {
-                "limit": min(1000, max_download - len(results)),
-                "status": "open",
-            }
-
-            if cursor:
-                params["cursor"] = cursor
-
-            if params_extra:
-                params.update(params_extra)
-
-            try:
-                r = session.get(f"{base_url}/markets", params=params, timeout=20)
-                if not r.ok:
-                    break
-
-                data = r.json()
-                batch = data.get("markets", []) if isinstance(data, dict) else []
-
-                if not batch:
-                    break
-
-                results.extend([x for x in batch if isinstance(x, dict)])
-
-                cursor = data.get("cursor") or data.get("next_cursor")
-                if not cursor:
-                    break
-
-            except Exception:
-                break
-
-        return dedupe(results, ["ticker", "title"])
-
-    if search.strip():
-        for base_url in base_urls:
-            searched = download_from_base(base_url, {"search": search.strip()})
-            if searched:
-                return searched
-
-    for base_url in base_urls:
-        generic = download_from_base(base_url)
-        if generic:
-            return generic
-
-    st.warning("Kalshi non disponibile: entrambi gli host API non hanno restituito mercati.")
-    return []
-
-
-@st.cache_data(ttl=8, show_spinner=False)
-def get_poly_book(token_id: str) -> Dict[str, Any]:
-    r = requests.get(f"{POLY_CLOB}/book", params={"token_id": token_id}, timeout=12)
-    r.raise_for_status()
-    return r.json()
-
-
-@st.cache_data(ttl=8, show_spinner=False)
-def get_kalshi_orderbook(ticker: str) -> Dict[str, Any]:
-    last_error = None
-    for base in [KALSHI_BASE, KALSHI_BASE_ALT]:
-        try:
-            r = requests.get(f"{base}/markets/{ticker}/orderbook", timeout=12)
-            if r.ok:
-                return r.json()
-            last_error = f"{r.status_code}: {r.text[:120]}"
         except Exception as e:
-            last_error = str(e)
-    raise RuntimeError(last_error or "Kalshi orderbook non disponibile")
+            return results, str(e)
+
+    return results, ""
 
 
-# -----------------------------
-# Price extraction
-# -----------------------------
+def parse_jsonish(x: Any) -> Any:
+    if isinstance(x, (list, dict)):
+        return x
+    if x is None:
+        return None
+    try:
+        return json.loads(x)
+    except Exception:
+        return None
+
 
 def polymarket_yes_token(m: Dict[str, Any]) -> Optional[str]:
-    outcomes = [x.lower() for x in parse_json_list(m.get("outcomes"))]
-    tokens = parse_json_list(m.get("clobTokenIds"))
-    if not tokens:
-        return None
-    if outcomes and "yes" in outcomes:
-        idx = outcomes.index("yes")
-        if idx < len(tokens):
-            return tokens[idx]
-    return tokens[0]
+    clob_ids = parse_jsonish(m.get("clobTokenIds"))
+    outcomes = parse_jsonish(m.get("outcomes"))
+
+    if isinstance(clob_ids, list) and len(clob_ids) > 0:
+        if isinstance(outcomes, list):
+            for i, out in enumerate(outcomes):
+                if str(out).lower() == "yes" and i < len(clob_ids):
+                    return str(clob_ids[i])
+        return str(clob_ids[0])
+
+    token = m.get("yesTokenId") or m.get("token_id") or m.get("conditionId")
+    return str(token) if token else None
 
 
-def best_poly_prices(book: Dict[str, Any]) -> Tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
-    bids = book.get("bids") or []
-    asks = book.get("asks") or []
-    bid_rows = [(price_to_decimal(x.get("price")), dec(x.get("size"))) for x in bids if isinstance(x, dict)]
-    ask_rows = [(price_to_decimal(x.get("price")), dec(x.get("size"))) for x in asks if isinstance(x, dict)]
-    bid_rows = [(p, s) for p, s in bid_rows if p is not None]
-    ask_rows = [(p, s) for p, s in ask_rows if p is not None]
-    best_bid = max([p for p, _ in bid_rows], default=None)
-    best_ask = min([p for p, _ in ask_rows], default=None)
-    bid_size = next((s for p, s in bid_rows if p == best_bid), None) if best_bid is not None else None
-    ask_size = next((s for p, s in ask_rows if p == best_ask), None) if best_ask is not None else None
-    return best_bid, best_ask, bid_size, ask_size
+@st.cache_data(ttl=25, show_spinner=False)
+def get_poly_orderbook(token_id: str) -> Tuple[Optional[Decimal], Optional[Decimal], str]:
+    if not token_id:
+        return None, None, "missing token"
+
+    try:
+        r = SESSION.get(f"{POLY_CLOB}/book", params={"token_id": token_id}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        bids = data.get("bids") or []
+        asks = data.get("asks") or []
+
+        best_bid = None
+        best_ask = None
+
+        if bids:
+            bid_prices = [dec(x.get("price")) for x in bids if isinstance(x, dict)]
+            bid_prices = [x for x in bid_prices if x > 0]
+            best_bid = max(bid_prices) if bid_prices else None
+
+        if asks:
+            ask_prices = [dec(x.get("price")) for x in asks if isinstance(x, dict)]
+            ask_prices = [x for x in ask_prices if x > 0]
+            best_ask = min(ask_prices) if ask_prices else None
+
+        return best_bid, best_ask, "ok"
+
+    except Exception as e:
+        return None, None, str(e)
 
 
-def best_kalshi_prices_from_market(m: Dict[str, Any]) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-    bid = price_to_decimal(m.get("yes_bid") or m.get("yes_bid_dollars"))
-    ask = price_to_decimal(m.get("yes_ask") or m.get("yes_ask_dollars"))
+def fallback_poly_prices(m: Dict[str, Any]) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+    bid = None
+    ask = None
+
+    for k in ["bestBid", "best_bid", "bid", "yesBid"]:
+        if m.get(k) is not None:
+            bid = dec(m.get(k))
+            break
+
+    for k in ["bestAsk", "best_ask", "ask", "yesAsk"]:
+        if m.get(k) is not None:
+            ask = dec(m.get(k))
+            break
+
+    if bid is not None and bid > 1:
+        bid = bid / Decimal("100")
+    if ask is not None and ask > 1:
+        ask = ask / Decimal("100")
+
     return bid, ask
 
 
-def best_kalshi_prices_from_book(ob: Dict[str, Any]) -> Tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
-    book = ob.get("orderbook_fp") or ob.get("orderbook") or {}
-    yes = book.get("yes_dollars") or book.get("yes") or []
-    no = book.get("no_dollars") or book.get("no") or []
+def is_relevant_poly_market(m: Dict[str, Any], theme: str) -> bool:
+    text = " ".join([
+        str(m.get("question") or ""),
+        str(m.get("title") or ""),
+        str(m.get("description") or ""),
+        str(m.get("category") or ""),
+        str(m.get("slug") or ""),
+    ])
 
-    yes_rows = []
-    for row in yes:
-        if isinstance(row, (list, tuple)) and len(row) >= 2:
-            p = price_to_decimal(row[0])
-            if p is not None:
-                yes_rows.append((p, dec(row[1])))
-    no_rows = []
-    for row in no:
-        if isinstance(row, (list, tuple)) and len(row) >= 2:
-            p = price_to_decimal(row[0])
-            if p is not None:
-                no_rows.append((p, dec(row[1])))
+    q = canonical(text)
 
-    best_yes_bid = max([p for p, _ in yes_rows], default=None)
-    best_no_bid = max([p for p, _ in no_rows], default=None)
-    best_yes_ask = (Decimal("1") - best_no_bid) if best_no_bid is not None else None
-    best_no_ask = (Decimal("1") - best_yes_bid) if best_yes_bid is not None else None
-    return best_yes_bid, best_yes_ask, best_no_bid, best_no_ask
+    if theme.strip():
+        for term in canonical(theme).split():
+            if term and term not in q:
+                return False
 
+    # Sports-focused first version.
+    sport_terms = [
+        " vs ", " win", "winner", "spread", "over", "under", "goals", "runs", "points",
+        "nba", "mlb", "nfl", "soccer", "football", "tennis", "world cup",
+        "premier league", "serie a", "la liga", "champions league",
+    ]
 
-def net_edge(buy_price: Optional[Decimal], sell_price: Optional[Decimal], buffer_bps: Decimal) -> Optional[Decimal]:
-    if buy_price is None or sell_price is None:
-        return None
-    buffer_cost = (buy_price + sell_price) * buffer_bps / Decimal("10000")
-    return sell_price - buy_price - buffer_cost
+    return any(t in q for t in sport_terms)
 
 
-def fmt_price(x: Optional[Decimal]) -> str:
-    if x is None:
-        return ""
-    return f"{float(x):.4f}"
+# ============================================================
+# Odds API
+# ============================================================
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_sports(api_key: str) -> Tuple[List[Dict[str, Any]], str]:
+    if not api_key:
+        return [], "Missing API key"
+
+    try:
+        r = SESSION.get(f"{ODDS_API_BASE}/sports", params={"apiKey": api_key}, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}: {r.text[:300]}"
+        data = r.json()
+        if not isinstance(data, list):
+            return [], "Unexpected sports response"
+        return data, ""
+    except Exception as e:
+        return [], str(e)
 
 
-def fmt_pct(x: Optional[Decimal]) -> str:
-    if x is None:
-        return ""
-    return f"{float(x * Decimal('100')):.2f}%"
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_odds(
+    api_key: str,
+    sport_key: str,
+    regions: str,
+    markets: str,
+    odds_format: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
+    if not api_key:
+        return [], {}, "Missing API key"
 
+    params = {
+        "apiKey": api_key,
+        "regions": regions,
+        "markets": markets,
+        "oddsFormat": odds_format,
+        "dateFormat": "iso",
+    }
 
-# -----------------------------
-# Scanner
-# -----------------------------
+    try:
+        r = SESSION.get(f"{ODDS_API_BASE}/sports/{sport_key}/odds", params=params, timeout=30)
 
-def quick_filter(query: str, m: Dict[str, Any]) -> bool:
-    if not query.strip():
-        return True
-    q_terms = keywords(query)
-    if not q_terms:
-        return True
-    return bool(q_terms & keywords(text_of_market(m)))
-
-
-def candidate_pairs(poly_markets: List[Dict[str, Any]], kalshi_markets: List[Dict[str, Any]], min_similarity: float, max_pairs: int) -> List[Dict[str, Any]]:
-    """
-    Trova pair candidati in modo piu' permissivo e conserva anche candidati sotto soglia per debug.
-    """
-    candidates = []
-
-    k_index: Dict[str, List[int]] = {}
-    for i, km in enumerate(kalshi_markets):
-        if is_bad_kalshi_market(km) or is_strictly_bad_kalshi(km):
-            continue
-        for kw in list(keywords(kalshi_matching_text(km)))[:30]:
-            k_index.setdefault(kw, []).append(i)
-
-    for pm in poly_markets:
-        pm_text = text_of_market(pm)
-        pm_keys = keywords(pm_text)
-        possible_idx = set()
-
-        for kw in pm_keys:
-            possible_idx.update(k_index.get(kw, []))
-
-        if not possible_idx:
-            possible_idx = set(range(min(len(kalshi_markets), 800)))
-
-        local = []
-        for idx in possible_idx:
-            km = kalshi_markets[idx]
-            score, details = similarity(pm_text, kalshi_matching_text(km))
-            local.append((score, details, km))
-
-        local.sort(key=lambda x: x[0], reverse=True)
-
-        for score, details, km in local[:5]:
-            candidates.append({
-                "poly": pm,
-                "kalshi": km,
-                "similarity": score,
-                "details": details,
-                "passes_similarity": score >= min_similarity,
-            })
-
-    candidates.sort(key=lambda x: x["similarity"], reverse=True)
-    passed = [c for c in candidates if c["passes_similarity"]]
-    debug = [c for c in candidates if not c["passes_similarity"]]
-    return (passed + debug)[:max_pairs]
-
-
-def scan_opportunities(
-    poly_markets: List[Dict[str, Any]],
-    kalshi_markets: List[Dict[str, Any]],
-    min_similarity: float,
-    max_pairs: int,
-    buffer_bps: Decimal,
-    min_edge: Decimal,
-    read_orderbooks: bool,
-    capital_per_trade: Decimal,
-    matching_mode: str,
-    fast_mode: bool,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Ritorna tre tabelle:
-    - opportunita': solo pair validi con edge >= filtro;
-    - debug: solo pair strutturalmente compatibili;
-    - rejected: pair scartati per famiglia/squadra/soglia/data o bundle Kalshi.
-    """
-    pairs = candidate_pairs(poly_markets, kalshi_markets, min_similarity, max_pairs)
-    opportunity_rows = []
-    debug_rows = []
-    rejected_rows = []
-
-    if not pairs:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    progress = st.progress(0, text="Analisi pair candidati... 0%")
-    status_box = st.empty()
-    start_ts = time.time()
-    total = max(1, len(pairs))
-
-    for n, pair in enumerate(pairs, start=1):
-        pm = pair["poly"]
-        km = pair["kalshi"]
-
-        structured_ok, structured_reason = structured_pair_ok(pm, km, matching_mode)
-
-        token = polymarket_yes_token(pm)
-        ticker = km.get("ticker")
-
-        p_bid = p_ask = p_bid_size = p_ask_size = None
-        k_bid = k_ask = None
-        status = "ok"
-        reject_reason = ""
-
-        # Velocita: se il pair non e' strutturalmente compatibile, non leggiamo orderbook.
-        # Questo evita centinaia di chiamate API inutili.
-        if fast_mode and not structured_ok:
-            base_row = {
-                "edge_netto": None,
-                "edge_netto_%": "",
-                "trade": "",
-                "confidence": confidence(pair["similarity"], pair["details"]),
-                "similarity": round(pair["similarity"], 3),
-                "passes_similarity": pair.get("passes_similarity", False),
-                "structured_ok": structured_ok,
-                "structured_reason": structured_reason,
-                "market_family_poly": market_family_from_text(text_of_market(pm)),
-                "market_family_kalshi": market_family_from_text(kalshi_matching_text(km)),
-                "motivo_scarto": structured_reason,
-                "polymarket": pm.get("question") or pm.get("title") or pm.get("eventTitle"),
-                "kalshi": kalshi_display_question(km),
-                "kalshi_title_raw": km.get("title"),
-                "kalshi_subtitle_raw": km.get("subtitle"),
-                "poly_bid": "",
-                "poly_ask": "",
-                "poly_no_ask_stimato": "",
-                "kalshi_bid": "",
-                "kalshi_ask": "",
-                "kalshi_no_ask_stimato": "",
-                "costo_per_contratto": "",
-                "profitto_per_contratto": "",
-                "roi_netto_%": "",
-                "capitale_trade": fmt_money(capital_per_trade),
-                "contratti_stimati": "",
-                "profitto_stimato_$": "",
-                "poly_liquidity": to_float(pm.get("liquidity") or pm.get("liquidityNum")),
-                "poly_volume24h": to_float(pm.get("volume24hr") or pm.get("volume24hrClob")),
-                "kalshi_volume": to_float(km.get("volume")),
-                "kalshi_liquidity": to_float(km.get("liquidity")),
-                "kalshi_ticker": ticker,
-                "poly_token_yes": token,
-                "poly_link": market_link_poly(pm),
-                "kalshi_link": market_link_kalshi(km),
-                "matching_detail": json.dumps(pair["details"]),
-                "status": "scartato prima degli orderbook",
-            }
-            rejected_rows.append(base_row)
-
-            pct = n / total
-            elapsed = time.time() - start_ts
-            eta = (elapsed / n) * (total - n) if n > 0 else 0
-            progress.progress(
-                pct,
-                text=f"Analisi pair {n}/{total} - {pct*100:.1f}% - ETA {eta:.0f}s"
-            )
-            status_box.caption(
-                f"Compatibili trovati: {len(debug_rows)} | Opportunita: {len(opportunity_rows)} | Scartati: {len(rejected_rows)}"
-            )
-            continue
-
-        try:
-            if token and read_orderbooks:
-                pb = get_poly_book(token)
-                p_bid, p_ask, p_bid_size, p_ask_size = best_poly_prices(pb)
-            elif not token:
-                reject_reason = "token Polymarket YES mancante"
-        except Exception as e:
-            status = f"Polymarket err: {str(e)[:80]}"
-            reject_reason = "errore orderbook Polymarket"
-
-        try:
-            k_bid, k_ask = best_kalshi_prices_from_market(km)
-            if ticker and read_orderbooks and (k_bid is None or k_ask is None):
-                kb = get_kalshi_orderbook(ticker)
-                k_bid, k_ask, _, _ = best_kalshi_prices_from_book(kb)
-            elif not ticker:
-                reject_reason = reject_reason or "ticker Kalshi mancante"
-        except Exception as e:
-            status = f"Kalshi err: {str(e)[:80]}" if status == "ok" else status + " | Kalshi err"
-            reject_reason = reject_reason or "errore orderbook Kalshi"
-
-        e1 = net_edge(p_ask, k_bid, buffer_bps)
-        e2 = net_edge(k_ask, p_bid, buffer_bps)
-
-        best_edge = None
-        best_trade = ""
-
-        if e1 is not None:
-            best_edge = e1
-            best_trade = "Compra YES Polymarket / vendi YES Kalshi"
-
-        if e2 is not None and (best_edge is None or e2 > best_edge):
-            best_edge = e2
-            best_trade = "Compra YES Kalshi / vendi YES Polymarket"
-
-        # Arbitraggio piu' realistico: compra YES su una piattaforma + compra NO sull'altra.
-        # NO ask e' stimato come 1 - YES bid.
-        yn1_cost, yn1_profit, yn1_roi = arbitrage_yes_no(p_ask, k_bid, buffer_bps)
-        yn2_cost, yn2_profit, yn2_roi = arbitrage_yes_no(k_ask, p_bid, buffer_bps)
-
-        best_yn_cost = None
-        best_yn_profit = None
-        best_yn_roi = None
-        best_yn_trade = ""
-
-        if yn1_profit is not None:
-            best_yn_cost = yn1_cost
-            best_yn_profit = yn1_profit
-            best_yn_roi = yn1_roi
-            best_yn_trade = "Compra YES Polymarket + compra NO Kalshi"
-
-        if yn2_profit is not None and (best_yn_profit is None or yn2_profit > best_yn_profit):
-            best_yn_cost = yn2_cost
-            best_yn_profit = yn2_profit
-            best_yn_roi = yn2_roi
-            best_yn_trade = "Compra YES Kalshi + compra NO Polymarket"
-
-        # Per ordinare usiamo prima l'arbitraggio YES+NO, poi il vecchio spread buy/sell.
-        if best_yn_profit is not None:
-            best_edge = best_yn_profit
-            best_trade = best_yn_trade
-
-        contracts_est = estimated_contracts_from_capital(capital_per_trade, best_yn_cost)
-        profit_est = (contracts_est * best_yn_profit) if contracts_est is not None and best_yn_profit is not None else None
-
-        if best_edge is None:
-            reject_reason = reject_reason or "prezzi bid/ask insufficienti"
-        elif best_edge < min_edge:
-            reject_reason = f"edge sotto filtro ({fmt_pct(best_edge)} < {fmt_pct(min_edge)})"
-        elif pair["similarity"] < min_similarity:
-            reject_reason = f"similarita sotto filtro ({pair['similarity']:.3f} < {min_similarity:.3f})"
-
-        base_row = {
-            "edge_netto": float(best_edge) if best_edge is not None else None,
-            "edge_netto_%": fmt_pct(best_edge),
-            "trade": best_trade,
-            "confidence": confidence(pair["similarity"], pair["details"]),
-            "similarity": round(pair["similarity"], 3),
-            "passes_similarity": pair.get("passes_similarity", False),
-            "structured_ok": structured_ok,
-            "structured_reason": structured_reason,
-            "market_family_poly": market_family_from_text(text_of_market(pm)),
-            "market_family_kalshi": market_family_from_text(kalshi_matching_text(km)),
-            "polymarket": pm.get("question") or pm.get("title") or pm.get("eventTitle"),
-            "kalshi": kalshi_display_question(km),
-            "kalshi_title_raw": km.get("title"),
-            "kalshi_subtitle_raw": km.get("subtitle"),
-            "poly_bid": fmt_price(p_bid),
-            "poly_ask": fmt_price(p_ask),
-            "poly_no_ask_stimato": fmt_price(no_ask_from_yes_bid(p_bid)),
-            "kalshi_bid": fmt_price(k_bid),
-            "kalshi_ask": fmt_price(k_ask),
-            "kalshi_no_ask_stimato": fmt_price(no_ask_from_yes_bid(k_bid)),
-            "costo_per_contratto": fmt_price(best_yn_cost),
-            "profitto_per_contratto": fmt_price(best_yn_profit),
-            "roi_netto_%": fmt_pct(best_yn_roi),
-            "capitale_trade": fmt_money(capital_per_trade),
-            "contratti_stimati": fmt_decimal(contracts_est),
-            "profitto_stimato_$": fmt_money(profit_est),
-            "poly_liquidity": to_float(pm.get("liquidity") or pm.get("liquidityNum")),
-            "poly_volume24h": to_float(pm.get("volume24hr") or pm.get("volume24hrClob")),
-            "kalshi_volume": to_float(km.get("volume")),
-            "kalshi_liquidity": to_float(km.get("liquidity")),
-            "kalshi_ticker": ticker,
-            "poly_token_yes": token,
-            "poly_link": market_link_poly(pm),
-            "kalshi_link": market_link_kalshi(km),
-            "matching_detail": json.dumps(pair["details"]),
-            "status": status,
-            "motivo_scarto": reject_reason,
+        quota = {
+            "requests_remaining": r.headers.get("x-requests-remaining"),
+            "requests_used": r.headers.get("x-requests-used"),
+            "requests_last": r.headers.get("x-requests-last"),
         }
 
-        # Regole severe per la tabella opportunita':
-        # - niente mercati Kalshi multi-game/cross-category;
-        # - niente prezzi zero/mancanti;
-        # - niente confidence Bassa;
-        # - similarita sopra soglia.
-        is_real_candidate = (
-            best_yn_profit is not None
-            and best_yn_profit >= min_edge
-            and pair["similarity"] >= min_similarity
-            and structured_ok
-            and confidence(pair["similarity"], pair["details"]) != "Bassa"
-            and not is_bad_kalshi_market(km)
-            and not is_strictly_bad_kalshi(km)
-            and valid_price_pair(p_bid, p_ask)
-            and valid_price_pair(k_bid, k_ask)
-        )
+        if r.status_code != 200:
+            return [], quota, f"HTTP {r.status_code}: {r.text[:500]}"
 
-        if not is_real_candidate and not reject_reason:
-            if not structured_ok:
-                base_row["motivo_scarto"] = structured_reason
-            elif is_bad_kalshi_market(km) or is_strictly_bad_kalshi(km):
-                base_row["motivo_scarto"] = "Kalshi multi-game/cross-category"
-            elif not valid_price_pair(k_bid, k_ask):
-                base_row["motivo_scarto"] = "prezzi Kalshi non validi o zero"
-            elif not valid_price_pair(p_bid, p_ask):
-                base_row["motivo_scarto"] = "prezzi Polymarket non validi"
-            elif confidence(pair["similarity"], pair["details"]) == "Bassa":
-                base_row["motivo_scarto"] = "confidence Bassa"
+        data = r.json()
+        if not isinstance(data, list):
+            return [], quota, "Unexpected odds response"
 
-        if structured_ok:
-            debug_rows.append(base_row)
-        else:
-            rejected_rows.append(base_row)
+        return data, quota, ""
 
-        if is_real_candidate:
-            opportunity_rows.append(base_row)
+    except Exception as e:
+        return [], {}, str(e)
 
-        pct = n / total
-        elapsed = time.time() - start_ts
-        eta = (elapsed / n) * (total - n) if n > 0 else 0
-        progress.progress(
-            pct,
-            text=f"Analisi pair {n}/{total} - {pct*100:.1f}% - ETA {eta:.0f}s"
-        )
-        status_box.caption(
-            f"Compatibili trovati: {len(debug_rows)} | Opportunita: {len(opportunity_rows)} | Scartati: {len(rejected_rows)}"
-        )
-        time.sleep(0.002 if fast_mode else 0.01)
+
+def flatten_odds(events: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+
+    for ev in events:
+        event_id = ev.get("id")
+        sport_key = ev.get("sport_key")
+        sport_title = ev.get("sport_title")
+        home = ev.get("home_team") or ""
+        away = ev.get("away_team") or ""
+        commence = ev.get("commence_time")
+        event_label = f"{away} @ {home}" if home and away else str(event_id)
+
+        for bm in ev.get("bookmakers", []) or []:
+            bookmaker = bm.get("title") or bm.get("key")
+            bookmaker_key = bm.get("key")
+            last_update = bm.get("last_update")
+
+            for market in bm.get("markets", []) or []:
+                market_key = market.get("key")
+
+                for outcome in market.get("outcomes", []) or []:
+                    name = outcome.get("name")
+                    point = outcome.get("point")
+                    price = dec(outcome.get("price"))
+
+                    if price <= 1:
+                        continue
+
+                    implied = implied_prob_from_decimal_odds(price)
+                    rows.append({
+                        "event_id": event_id,
+                        "sport_key": sport_key,
+                        "sport_title": sport_title,
+                        "event": event_label,
+                        "home_team": home,
+                        "away_team": away,
+                        "commence_time": commence,
+                        "start": short_time(commence),
+                        "bookmaker": bookmaker,
+                        "bookmaker_key": bookmaker_key,
+                        "last_update": last_update,
+                        "market_key": market_key,
+                        "market": market_key,
+                        "outcome": name,
+                        "point": point,
+                        "decimal_odds": float(price),
+                        "implied_probability": float(implied or Decimal("0")),
+                    })
+
+    return pd.DataFrame(rows)
+
+
+def best_odds_for_event(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    group_cols = ["event_id", "event", "home_team", "away_team", "start", "market_key", "outcome", "point"]
+    for keys, g in df.groupby(group_cols, dropna=False):
+        event_id, event, home, away, start, market_key, outcome, point = keys
+
+        best_idx = g["decimal_odds"].idxmax()
+        best = g.loc[best_idx]
+
+        odds = dec(best["decimal_odds"])
+        implied = implied_prob_from_decimal_odds(odds)
+
+        avg_implied = Decimal(str(g["implied_probability"].mean())) if len(g) else None
+
+        rows.append({
+            "event_id": event_id,
+            "event": event,
+            "home_team": home,
+            "away_team": away,
+            "start": start,
+            "market_key": market_key,
+            "outcome": outcome,
+            "point": "" if pd.isna(point) else point,
+            "best_bookmaker": best["bookmaker"],
+            "best_odds": float(odds),
+            "best_implied_probability": float(implied or Decimal("0")),
+            "avg_market_implied_probability": float(avg_implied or Decimal("0")),
+            "books_compared": int(len(g)),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def no_vig_probabilities(g: pd.DataFrame) -> Dict[str, Decimal]:
+    """
+    Converts best odds for outcomes in one event/market group into no-vig probabilities.
+    """
+    probs = {}
+    total = Decimal("0")
+
+    for _, row in g.iterrows():
+        odds = dec(row.get("best_odds"))
+        p = implied_prob_from_decimal_odds(odds)
+        if p is None:
+            continue
+        key = f"{row.get('outcome')}|{row.get('point')}"
+        probs[key] = p
+        total += p
+
+    if total <= 0:
+        return {}
+
+    return {k: v / total for k, v in probs.items()}
+
+
+# ============================================================
+# Matching Polymarket vs Odds
+# ============================================================
+
+def candidate_poly_questions(poly_markets: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for m in poly_markets:
+        question = m.get("question") or m.get("title") or ""
+        if not question:
+            continue
+
+        volume = safe_float(m.get("volume24hr") or m.get("volume24hrClob") or m.get("volume") or 0) or 0
+        liquidity = safe_float(m.get("liquidity") or m.get("liquidityNum") or 0) or 0
+
+        rows.append({
+            "poly_id": m.get("id") or m.get("conditionId"),
+            "question": question,
+            "market_type": poly_market_type(question),
+            "volume": volume,
+            "liquidity": liquidity,
+            "slug": m.get("slug"),
+            "token_yes": polymarket_yes_token(m),
+            "raw": m,
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["volume", "liquidity"], ascending=[False, False])
+    return df
+
+
+def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_candidates: int) -> pd.DataFrame:
+    if poly_df.empty or odds_best_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    odds_by_event = odds_best_df.groupby(["event_id", "event", "home_team", "away_team", "start"], dropna=False)
+
+    count = 0
+    for _, p in poly_df.head(max_candidates).iterrows():
+        q = p["question"]
+        p_type = p["market_type"]
+
+        if p_type == "unknown":
+            continue
+
+        for (event_id, event, home, away, start), eg in odds_by_event:
+            event_text = f"{event} {home} {away}"
+            sim = text_similarity(q, event_text)
+
+            # Keep broad enough for debug, strict enough to avoid total noise.
+            if sim < Decimal("0.08"):
+                continue
+
+            target_market = p_type
+            mg = eg[eg["market_key"] == target_market].copy()
+
+            if mg.empty:
+                continue
+
+            target_outcome = None
+            target_point = None
+            confidence = "Bassa"
+            reason = ""
+
+            if target_market == "h2h":
+                side = outcome_side_from_poly_question(q, home, away)
+                if side:
+                    target_outcome = side
+                    confidence = "Media" if sim >= Decimal("0.12") else "Bassa"
+                    reason = "team match"
+                else:
+                    continue
+
+            elif target_market == "totals":
+                line = extract_total_line(q)
+                qn = canonical(q)
+                if line is None:
+                    continue
+
+                if "over" in qn:
+                    target_outcome = "Over"
+                elif "under" in qn:
+                    target_outcome = "Under"
+                else:
+                    continue
+
+                target_point = line
+                confidence = "Media" if sim >= Decimal("0.10") else "Bassa"
+                reason = "total line match"
+
+            elif target_market == "spreads":
+                # V1: keep only debug candidates, because spread wording is more dangerous.
+                continue
+
+            if target_outcome is None:
+                continue
+
+            # Find exact outcome in bookmaker best odds.
+            candidates = mg[mg["outcome"].apply(lambda x: canonical(x) == canonical(target_outcome))].copy()
+
+            if target_point is not None:
+                candidates = candidates[candidates["point"].apply(lambda x: dec(x, "-999") == target_point)]
+
+            if candidates.empty:
+                continue
+
+            # Compute no-vig fair probability using all outcomes for same event/market/point.
+            point_filter = "" if target_point is None else str(float(target_point)).rstrip("0").rstrip(".")
+            if target_point is None:
+                group_for_probs = mg
+            else:
+                group_for_probs = mg[mg["point"].apply(lambda x: dec(x, "-999") == target_point)]
+
+            no_vig = no_vig_probabilities(group_for_probs)
+
+            best = candidates.sort_values("best_odds", ascending=False).iloc[0]
+            key = f"{best['outcome']}|{best['point']}"
+            fair_prob = no_vig.get(key)
+
+            if fair_prob is None:
+                # fallback: average implied, less good
+                fair_prob = Decimal(str(best["avg_market_implied_probability"]))
+
+            # Upgrade confidence for exact team/event plus enough books.
+            if confidence == "Media" and int(best["books_compared"]) >= 3 and sim >= Decimal("0.16"):
+                confidence = "Alta"
+
+            rows.append({
+                "confidence": confidence,
+                "reason": reason,
+                "similarity": float(sim),
+                "polymarket_question": q,
+                "poly_market_type": p_type,
+                "poly_token_yes": p["token_yes"],
+                "poly_volume": p["volume"],
+                "poly_liquidity": p["liquidity"],
+                "poly_link": market_link_poly(p["raw"]),
+                "odds_event": event,
+                "event_start": start,
+                "odds_market": target_market,
+                "odds_outcome": best["outcome"],
+                "odds_point": best["point"],
+                "best_bookmaker": best["best_bookmaker"],
+                "best_odds": best["best_odds"],
+                "books_compared": best["books_compared"],
+                "fair_probability": float(fair_prob),
+                "event_id": event_id,
+            })
+
+            count += 1
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["confidence", "similarity", "poly_volume"], ascending=[True, False, False])
+        conf_order = {"Alta": 0, "Media": 1, "Bassa": 2}
+        out["_conf_order"] = out["confidence"].map(conf_order).fillna(9)
+        out = out.sort_values(["_conf_order", "similarity", "poly_volume"], ascending=[True, False, False]).drop(columns=["_conf_order"])
+    return out
+
+
+def evaluate_candidates(candidates: pd.DataFrame, capital: Decimal, read_orderbooks: bool, min_edge: Decimal) -> pd.DataFrame:
+    if candidates.empty:
+        return pd.DataFrame()
+
+    rows = []
+    total = len(candidates)
+    progress = st.progress(0, text="Valuto candidati Polymarket... 0%")
+    status = st.empty()
+
+    for i, (_, row) in enumerate(candidates.iterrows(), start=1):
+        token = row.get("poly_token_yes")
+        poly_bid = poly_ask = None
+        book_status = "not read"
+
+        if read_orderbooks and token:
+            poly_bid, poly_ask, book_status = get_poly_orderbook(str(token))
+
+        if poly_bid is None or poly_ask is None:
+            raw = None
+            # p raw is not in candidates, fallback unavailable here.
+            book_status = book_status if book_status != "not read" else "missing price"
+
+        fair = dec(row.get("fair_probability"), "0")
+        ask = poly_ask
+
+        edge = None
+        ev_on_capital = None
+        suggested_action = "No trade"
+
+        if ask is not None and ask > 0 and fair > 0:
+            edge = fair - ask
+            ev_on_capital = (capital / ask) * edge if ask > 0 else None
+
+            if edge >= min_edge:
+                suggested_action = "BUY YES Polymarket"
+            elif edge <= -min_edge:
+                suggested_action = "NO BUY - bookmaker fair lower"
+
+        rows.append({
+            **row.to_dict(),
+            "poly_bid": fmt_price(poly_bid),
+            "poly_ask": fmt_price(poly_ask),
+            "book_status": book_status,
+            "fair_probability_%": fmt_pct(fair),
+            "edge_vs_poly_ask": float(edge) if edge is not None else None,
+            "edge_vs_poly_ask_%": fmt_pct(edge),
+            "capital": fmt_money(capital),
+            "estimated_ev_$": fmt_money(ev_on_capital),
+            "suggested_action": suggested_action,
+        })
+
+        pct = i / total
+        progress.progress(pct, text=f"Valuto candidati {i}/{total} - {pct*100:.1f}%")
+        status.caption(f"Candidati valutati: {i}/{total}")
 
     progress.empty()
-    status_box.empty()
+    status.empty()
 
-    opp_df = pd.DataFrame(opportunity_rows)
-    debug_df = pd.DataFrame(debug_rows)
-    rejected_df = pd.DataFrame(rejected_rows)
-
-    if not opp_df.empty:
-        opp_df = opp_df.sort_values(["edge_netto", "similarity"], ascending=[False, False], na_position="last")
-
-    if not debug_df.empty:
-        debug_df = debug_df.sort_values(["edge_netto", "similarity"], ascending=[False, False], na_position="last")
-
-    if not rejected_df.empty:
-        rejected_df = rejected_df.sort_values(["similarity"], ascending=[False], na_position="last")
-
-    return opp_df, debug_df, rejected_df
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["suggested_action", "edge_vs_poly_ask", "similarity"], ascending=[True, False, False], na_position="last")
+    return out
 
 
-# -----------------------------
-# Sidebar controls
-# -----------------------------
+# ============================================================
+# Paper trade log
+# ============================================================
+
+def init_paper_log():
+    if "paper_trades" not in st.session_state:
+        st.session_state.paper_trades = []
+
+
+def add_paper_trade(row: Dict[str, Any], stake: Decimal):
+    trade = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "action": row.get("suggested_action"),
+        "stake": float(stake),
+        "polymarket_question": row.get("polymarket_question"),
+        "poly_ask": row.get("poly_ask"),
+        "fair_probability_%": row.get("fair_probability_%"),
+        "edge_vs_poly_ask_%": row.get("edge_vs_poly_ask_%"),
+        "estimated_ev_$": row.get("estimated_ev_$"),
+        "poly_link": row.get("poly_link"),
+        "odds_event": row.get("odds_event"),
+        "best_bookmaker": row.get("best_bookmaker"),
+        "best_odds": row.get("best_odds"),
+    }
+    st.session_state.paper_trades.append(trade)
+
+
+# ============================================================
+# UI
+# ============================================================
+
+init_paper_log()
+
+st.title("PolyEdge Scanner")
+st.caption(APP_VERSION)
+
+st.info(
+    "Obiettivo: usare Polymarket come mercato tradabile e le quote bookmaker come benchmark di probabilita. "
+    "Questa versione NON usa Kalshi."
+)
+
+st.warning(
+    "Trade automatici real-money non sono abilitati in questa app. Per sicurezza questa versione genera segnali, "
+    "trade plan e paper trade. L'esecuzione live su Polymarket richiede wallet/API key e va implementata solo in ambiente privato, non con private key su Streamlit Cloud."
+)
+
 with st.sidebar:
-    st.header("Impostazioni scanner")
-    search = st.text_input("Filtro tema", value="", placeholder="bitcoin, btc, fed, world cup, mexico...")
-    matching_mode = st.selectbox("Modalita matching", ["Sport strict", "Crypto strict", "Macro/Fed strict", "Auto strict"], index=0)
-    poly_download = st.slider("Mercati Polymarket da scaricare", 500, 8000, 3000, step=500)
-    kalshi_download = st.slider("Mercati Kalshi da scaricare", 100, 3000, 1000, step=100)
-    top_poly = st.slider("Top Polymarket usati nello scanner", 20, 1500, 300, step=10)
-    top_kalshi = st.slider("Top Kalshi usati nello scanner", 20, 3000, 600, step=20)
-    max_pairs = st.slider("Pair candidati da analizzare", 10, 1000, 150, step=10)
-    fast_mode = st.checkbox("Modalita veloce", value=True)
-    min_similarity = st.slider("Similarita\' minima matching", 0.05, 0.95, 0.35, step=0.01)
-    min_edge_pct = st.number_input("Mostra solo edge netto >= %", min_value=-20.0, max_value=20.0, value=0.0, step=0.1)
-    capital_per_trade = Decimal(str(st.number_input("Capitale per trade ($)", min_value=1.0, max_value=100000.0, value=100.0, step=50.0)))
-    buffer_bps = Decimal(str(st.number_input("Buffer fee/slippage, bps", min_value=0, max_value=1500, value=0, step=10)))
-    read_orderbooks = st.checkbox("Leggi orderbook live", value=True)
-    auto_refresh = st.checkbox("Auto-refresh 60 secondi", value=False)
+    st.header("Input")
+
+    odds_api_key = st.text_input(
+        "The Odds API key",
+        value=get_secret_or_env("ODDS_API_KEY", ""),
+        type="password",
+        help="Per usarla in cloud, aggiungi ODDS_API_KEY nei secrets di Streamlit.",
+    )
+
     if st.button("Svuota cache / aggiorna dati"):
         st.cache_data.clear()
-        st.rerun()
+        st.success("Cache svuotata. Rilancia lo scanner.")
+
     st.divider()
-    st.subheader("Pair manuale")
-    poly_token = st.text_input("Polymarket token_id / asset_id")
-    kalshi_ticker = st.text_input("Kalshi market ticker")
+
+    sport_default_options = [
+        "soccer_epl",
+        "soccer_italy_serie_a",
+        "soccer_spain_la_liga",
+        "soccer_uefa_champs_league",
+        "basketball_nba",
+        "baseball_mlb",
+        "americanfootball_nfl",
+        "tennis_atp",
+        "tennis_wta",
+    ]
+
+    sports, sports_err = fetch_sports(odds_api_key) if odds_api_key else ([], "")
+
+    if sports:
+        active = [s for s in sports if s.get("active", True)]
+        labels = [f"{s.get('title')} ({s.get('key')})" for s in active]
+        selected_label = st.selectbox("Sport The Odds API", labels, index=0)
+        selected_sport = active[labels.index(selected_label)].get("key")
+    else:
+        selected_sport = st.selectbox("Sport The Odds API", sport_default_options, index=0)
+        if sports_err:
+            st.caption(f"Sports API: {sports_err}")
+
+    regions = st.multiselect("Bookmaker regions", ["us", "uk", "eu", "au"], default=["us", "uk", "eu"])
+    markets = st.multiselect("Mercati bookmaker", ["h2h", "totals", "spreads"], default=["h2h", "totals"])
+
+    st.divider()
+
+    theme = st.text_input("Filtro Polymarket", value="", placeholder="world cup, bitcoin, nba, team name...")
+    poly_download = st.slider("Polymarket da scaricare", 100, 5000, 2500, step=100)
+    top_poly = st.slider("Top Polymarket da analizzare", 50, 1500, 400, step=50)
+    max_candidates = st.slider("Massimo candidati matching", 20, 1000, 250, step=10)
+
+    st.divider()
+
+    capital = dec(st.number_input("Capitale per trade ($)", min_value=1.0, max_value=100000.0, value=100.0, step=25.0))
+    min_edge_pct = st.number_input("Edge minimo vs Polymarket ask (%)", min_value=-50.0, max_value=50.0, value=2.0, step=0.25)
+    min_edge = dec(min_edge_pct) / Decimal("100")
+    read_orderbooks = st.checkbox("Leggi orderbook Polymarket live", value=True)
+    auto_refresh = st.checkbox("Auto-refresh 60 secondi", value=False)
+
+    st.divider()
+    st.caption("Trade automatici real-money: disabilitati in questa versione. Usa Paper Trade.")
+
 
 if auto_refresh:
-    st.write("Auto-refresh attivo: aggiorna manualmente con Svuota cache se vuoi forzare subito.")
+    time.sleep(60)
+    st.rerun()
 
-# -----------------------------
-# Tabs
-# -----------------------------
-tab_scan, tab_poly, tab_kalshi, tab_manual, tab_help = st.tabs([
-    "Scanner Opportunita'", "Mercati Polymarket", "Mercati Kalshi", "Pair manuale", "Note importanti"
+
+tab_scan, tab_poly, tab_odds, tab_paper, tab_setup = st.tabs([
+    "Scanner",
+    "Polymarket",
+    "Bookmaker Odds",
+    "Paper Trade",
+    "Setup",
 ])
 
+
 with tab_scan:
-    st.subheader("Scanner automatico Polymarket/Kalshi")
-    st.write(
-        "Lo scanner prova a trovare mercati simili tra le due piattaforme e calcola un edge teorico. "
-        "Le opportunita' con confidence Media/Bassa vanno verificate manualmente: wording e regole di settlement possono essere diversi."
-    )
-    st.info("Nuova logica: Kalshi single-market only. I bundle/multi-event vengono scartati prima del matching. In Modalita veloce legge gli orderbook solo sui pair compatibili.")
+    st.subheader("Scanner Polymarket vs bookmaker benchmark")
 
-    if st.button("Avvia scanner", type="primary"):
-        kalshi_removed = 0
-        with st.spinner("Scarico mercati Polymarket e Kalshi..."):
-            poly_all = get_polymarket_markets(search, poly_download)
-            kalshi_all = get_kalshi_markets(kalshi_download, "")
+    if not odds_api_key:
+        st.error("Inserisci una The Odds API key nella sidebar o nei secrets Streamlit come ODDS_API_KEY.")
+    elif not regions or not markets:
+        st.error("Seleziona almeno una regione e almeno un mercato.")
+    else:
+        if st.button("Avvia scanner", type="primary"):
+            with st.spinner("Scarico dati..."):
+                poly_markets, poly_err = fetch_polymarket_markets(poly_download, theme)
+                odds_events, quota, odds_err = fetch_odds(
+                    odds_api_key,
+                    selected_sport,
+                    ",".join(regions),
+                    ",".join(markets),
+                    "decimal",
+                )
 
-            poly_filtered = [m for m in poly_all if quick_filter(search, m)] if search.strip() else poly_all
-            kalshi_filtered = [m for m in kalshi_all if quick_filter(search, m)] if search.strip() else kalshi_all
+            if poly_err:
+                st.warning(f"Polymarket warning: {poly_err}")
+            if odds_err:
+                st.error(f"The Odds API error: {odds_err}")
+                st.stop()
 
-            poly_sorted = sorted(poly_filtered, key=lambda m: to_float(m.get("volume24hr") or m.get("liquidity") or 0), reverse=True)[:top_poly]
-            kalshi_sorted = sorted(kalshi_filtered, key=lambda m: to_float(m.get("volume") or m.get("liquidity") or 0), reverse=True)[:top_kalshi]
+            poly_filtered = [m for m in poly_markets if is_relevant_poly_market(m, theme)]
+            poly_df = candidate_poly_questions(poly_filtered).head(top_poly)
+            odds_df = flatten_odds(odds_events)
+            odds_best = best_odds_for_event(odds_df)
 
-        st.info(
-            f"Dataset: {len(poly_sorted)} Polymarket usati su {len(poly_all)} scaricati; "
-            f"{len(kalshi_sorted)} Kalshi usati su {len(kalshi_all)} single-market validi; "
-            f"{kalshi_removed} Kalshi bundle/multi scartati."
-        )
-        if fast_mode:
-            st.caption("Modalita veloce attiva: gli orderbook vengono letti solo dopo i controlli di compatibilita strutturale.")
-
-        if len(poly_all) <= 100 and poly_download > 100:
-            st.warning(
-                "Polymarket ha restituito solo 100 mercati anche se lo slider richiede di piu'. "
-                "Clicca 'Svuota cache / aggiorna dati'. Se resta cosi', probabilmente Gamma API sta limitando la risposta per il filtro scelto."
+            st.info(
+                f"Dataset: {len(poly_df)} Polymarket analizzati su {len(poly_markets)} scaricati; "
+                f"{len(odds_events)} eventi odds; {len(odds_df)} quote bookmaker."
             )
 
-        if not poly_sorted or not kalshi_sorted:
-            st.warning("Pochi dati trovati. Prova filtro vuoto oppure una keyword piu' ampia: crypto, election, fed, inflation.")
-        else:
-            min_edge = Decimal(str(min_edge_pct)) / Decimal("100")
-            df, debug_df, rejected_df = scan_opportunities(poly_sorted, kalshi_sorted, min_similarity, max_pairs, buffer_bps, min_edge, read_orderbooks, capital_per_trade, matching_mode, fast_mode)
+            if quota:
+                st.caption(f"Odds API quota: remaining={quota.get('requests_remaining')} used={quota.get('requests_used')} last={quota.get('requests_last')}")
 
-            view_cols = [
-                "edge_netto_%", "roi_netto_%", "profitto_stimato_$", "capitale_trade", "trade", "confidence", "similarity",
-                "polymarket", "kalshi", "poly_bid", "poly_ask", "poly_no_ask_stimato",
-                "kalshi_bid", "kalshi_ask", "kalshi_no_ask_stimato", "costo_per_contratto",
-                "profitto_per_contratto", "kalshi_ticker", "status"
-            ]
-
-            debug_cols = [
-                "edge_netto_%", "roi_netto_%", "profitto_stimato_$", "confidence", "similarity", "motivo_scarto",
-                "structured_reason", "market_family_poly", "market_family_kalshi",
-                "polymarket", "kalshi", "poly_bid", "poly_ask", "poly_no_ask_stimato",
-                "kalshi_bid", "kalshi_ask", "kalshi_no_ask_stimato", "costo_per_contratto",
-                "profitto_per_contratto", "kalshi_ticker", "status", "matching_detail"
-            ]
-
-            if df.empty:
-                st.warning("Nessuna opportunita' sopra i filtri impostati. Sotto trovi comunque i migliori pair candidati/debug.")
+            if poly_df.empty:
+                st.warning("Nessun mercato Polymarket rilevante trovato. Prova un filtro diverso o vuoto.")
+            elif odds_best.empty:
+                st.warning("Nessuna quota bookmaker trovata per sport/mercati/regioni scelti.")
             else:
-                st.success(f"Trovate {len(df)} opportunita' candidate YES+NO. Ordinate per profitto netto teorico.")
-                st.dataframe(df[view_cols], width="stretch", hide_index=True)
-                st.download_button(
-                    "Scarica CSV opportunita'",
-                    df.to_csv(index=False).encode("utf-8"),
-                    file_name="oddpool_lite_opportunita.csv",
-                    mime="text/csv",
-                )
-                st.markdown("#### Link e dettagli")
-                for _, row in df.head(10).iterrows():
-                    st.markdown(
-                        f"- **Profitto stimato {row.get('profitto_stimato_$', '')}** | Edge {row['edge_netto_%']} | ROI {row.get('roi_netto_%', '')} | {row['confidence']} | "
-                        f"[Polymarket]({row['poly_link']}) | [Kalshi]({row['kalshi_link']}) | "
-                        f"Ticker Kalshi: `{row['kalshi_ticker']}` | Token PM: `{row['poly_token_yes']}`"
-                    )
+                with st.spinner("Matching strutturato Polymarket ↔ bookmaker odds..."):
+                    candidates = match_poly_to_odds(poly_df, odds_best, max_candidates)
 
-            st.markdown("### Debug matching pulito - solo pair strutturalmente compatibili")
-            st.caption(
-                "Qui vedi solo pair che passano i controlli di famiglia mercato, squadra/data/soglia e anti-bundle Kalshi."
-            )
-            if debug_df.empty:
-                st.info("Nessun pair strutturalmente compatibile generato. Prova una keyword piu' specifica oppure cambia modalita'.")
-            else:
-                st.dataframe(debug_df[debug_cols], width="stretch", hide_index=True)
-                st.download_button(
-                    "Scarica CSV debug matching pulito",
-                    debug_df.to_csv(index=False).encode("utf-8"),
-                    file_name="oddpool_lite_debug_matching_pulito.csv",
-                    mime="text/csv",
-                )
-
-            with st.expander("Pair scartati - solo per diagnosi avanzata"):
-                st.caption(
-                    "Questi sono confronti respinti. Per evitare confusione, non usarli come opportunita'. "
-                    "Aprili solo se vuoi capire cosa e' stato eliminato."
-                )
-                if rejected_df.empty:
-                    st.info("Nessun pair scartato.")
+                if candidates.empty:
+                    st.warning("Nessun candidato trovato. Prova un altro sport, filtro più specifico, o includi h2h/totals.")
                 else:
-                    rejected_cols = [
-                        "motivo_scarto", "structured_reason", "market_family_poly", "market_family_kalshi",
-                        "similarity", "polymarket", "kalshi", "kalshi_ticker", "matching_detail"
+                    st.markdown("### Candidati matching")
+                    cand_cols = [
+                        "confidence", "similarity", "polymarket_question", "odds_event", "event_start",
+                        "odds_market", "odds_outcome", "odds_point", "best_bookmaker", "best_odds",
+                        "books_compared", "fair_probability", "poly_link"
                     ]
-                    available_rejected_cols = [c for c in rejected_cols if c in rejected_df.columns]
-                    show_rejected = st.checkbox("Mostra a video i pair scartati", value=False)
-                    if show_rejected:
-                        st.dataframe(rejected_df[available_rejected_cols].head(300), width="stretch", hide_index=True)
-                    st.download_button(
-                        "Scarica CSV pair scartati",
-                        rejected_df.to_csv(index=False).encode("utf-8"),
-                        file_name="oddpool_lite_pair_scartati.csv",
-                        mime="text/csv",
-                    )
+                    st.dataframe(candidates[cand_cols].head(200), width="stretch", hide_index=True)
+
+                    st.markdown("### Valutazione edge")
+                    evaluated = evaluate_candidates(candidates, capital, read_orderbooks, min_edge)
+
+                    if evaluated.empty:
+                        st.info("Nessun candidato valutato.")
+                    else:
+                        main_cols = [
+                            "suggested_action", "confidence", "edge_vs_poly_ask_%", "estimated_ev_$",
+                            "capital", "poly_ask", "poly_bid", "fair_probability_%",
+                            "polymarket_question", "odds_event", "event_start",
+                            "odds_outcome", "best_bookmaker", "best_odds",
+                            "books_compared", "poly_link", "book_status"
+                        ]
+
+                        st.dataframe(evaluated[main_cols].head(300), width="stretch", hide_index=True)
+
+                        st.download_button(
+                            "Scarica CSV segnali",
+                            evaluated.to_csv(index=False).encode("utf-8"),
+                            file_name="polyedge_signals.csv",
+                            mime="text/csv",
+                        )
+
+                        buy_rows = evaluated[evaluated["suggested_action"] == "BUY YES Polymarket"].copy()
+                        if not buy_rows.empty:
+                            st.success(f"Trovati {len(buy_rows)} segnali BUY YES teorici sopra soglia.")
+                            selected_idx = st.selectbox(
+                                "Aggiungi un segnale al paper trade",
+                                buy_rows.index.tolist(),
+                                format_func=lambda i: f"{buy_rows.loc[i, 'edge_vs_poly_ask_%']} | {buy_rows.loc[i, 'polymarket_question'][:90]}"
+                            )
+                            paper_stake = dec(st.number_input("Stake paper trade ($)", min_value=1.0, max_value=100000.0, value=float(capital), step=25.0))
+                            if st.button("Aggiungi Paper Trade"):
+                                add_paper_trade(buy_rows.loc[selected_idx].to_dict(), paper_stake)
+                                st.success("Paper trade aggiunto.")
+                        else:
+                            st.info("Nessun BUY YES sopra soglia. Puoi abbassare edge minimo o cambiare sport/filtro.")
+
 
 with tab_poly:
     st.subheader("Mercati Polymarket")
-    with st.spinner("Carico Polymarket..."):
-        poly_all = get_polymarket_markets(search, poly_download)
-    poly_filtered = [m for m in poly_all if quick_filter(search, m)] if search.strip() else poly_all
-    st.caption(f"Mercati mostrati: {len(poly_filtered)} su {len(poly_all)} scaricati. Filtro: {search or 'nessuno'}")
-    if len(poly_all) <= 100 and poly_download > 100:
-        st.warning("Polymarket ha restituito al massimo 100 mercati. Prova filtro vuoto, svuota cache, oppure varia la keyword.")
-    rows = []
-    for m in poly_filtered[:500]:
-        outcomes = parse_json_list(m.get("outcomes"))
-        token_ids = parse_json_list(m.get("clobTokenIds"))
-        rows.append({
-            "question": m.get("question") or m.get("title") or m.get("eventTitle"),
-            "volume24hr": m.get("volume24hr"),
-            "liquidity": m.get("liquidity"),
-            "outcomes": ", ".join(outcomes),
-            "YES token": polymarket_yes_token(m),
-            "clobTokenIds": ", ".join(token_ids),
-            "endDate": m.get("endDate"),
-            "link": market_link_poly(m),
-        })
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
-with tab_kalshi:
-    st.subheader("Mercati Kalshi")
-    with st.spinner("Carico Kalshi..."):
-        kalshi_all_raw = get_kalshi_markets(kalshi_download, search)
-    kalshi_all = [m for m in kalshi_all_raw if not is_bad_kalshi_market(m) and not is_strictly_bad_kalshi(m)]
-    kalshi_removed = len(kalshi_all_raw) - len(kalshi_all)
-    kalshi_filtered = [m for m in kalshi_all if quick_filter(search, m)] if search.strip() else kalshi_all
-    st.caption(
-        f"Mercati mostrati: {len(kalshi_filtered)} su {len(kalshi_all)} single-market validi; "
-        f"{kalshi_removed} bundle/multi scartati; {len(kalshi_all_raw)} scaricati totali. Filtro: {search or 'nessuno'}"
-    )
-    rows = []
-    for m in kalshi_filtered[:500]:
-        bid, ask = best_kalshi_prices_from_market(m)
-        rows.append({
-            "ticker": m.get("ticker"),
-            "question_leggibile": kalshi_display_question(m),
-            "title": m.get("title"),
-            "subtitle": m.get("subtitle"),
-            "yes_bid": fmt_price(bid),
-            "yes_ask": fmt_price(ask),
-            "volume": m.get("volume"),
-            "liquidity": m.get("liquidity"),
-            "close_time": m.get("close_time"),
-            "link": market_link_kalshi(m),
-        })
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    if st.button("Carica Polymarket", key="load_poly"):
+        poly_markets, poly_err = fetch_polymarket_markets(poly_download, theme)
+        if poly_err:
+            st.warning(poly_err)
 
-with tab_manual:
-    st.subheader("Scanner pair manuale")
-    st.write("Inserisci un token_id Polymarket e, opzionalmente, il ticker Kalshi dello stesso evento/outcome.")
-    if st.button("Analizza pair manuale", type="primary"):
-        if not poly_token:
-            st.warning("Serve almeno il Polymarket token_id. Il ticker Kalshi e' opzionale.")
+        poly_filtered = [m for m in poly_markets if is_relevant_poly_market(m, theme)]
+        poly_df = candidate_poly_questions(poly_filtered)
+
+        st.caption(f"{len(poly_df)} mercati rilevanti su {len(poly_markets)} scaricati.")
+
+        if not poly_df.empty:
+            show_cols = ["question", "market_type", "volume", "liquidity", "token_yes", "slug"]
+            st.dataframe(poly_df[show_cols].head(500), width="stretch", hide_index=True)
+
+
+with tab_odds:
+    st.subheader("Bookmaker odds via The Odds API")
+
+    if not odds_api_key:
+        st.error("Inserisci The Odds API key.")
+    elif st.button("Carica bookmaker odds", key="load_odds"):
+        odds_events, quota, odds_err = fetch_odds(
+            odds_api_key,
+            selected_sport,
+            ",".join(regions),
+            ",".join(markets),
+            "decimal",
+        )
+
+        if odds_err:
+            st.error(odds_err)
         else:
-            col1, col2 = st.columns(2)
-            poly_prices = kalshi_prices = None
-            with col1:
-                st.markdown("### Polymarket")
-                try:
-                    pb = get_poly_book(poly_token.strip())
-                    p_bid, p_ask, p_bid_size, p_ask_size = best_poly_prices(pb)
-                    poly_prices = (p_bid, p_ask)
-                    st.metric("Best YES bid", fmt_price(p_bid) or "n/a")
-                    st.metric("Best YES ask", fmt_price(p_ask) or "n/a")
-                    st.write({"bid_size": str(p_bid_size), "ask_size": str(p_ask_size)})
-                except Exception as e:
-                    st.error(f"Errore Polymarket: {e}")
-            with col2:
-                st.markdown("### Kalshi")
-                if kalshi_ticker.strip():
-                    try:
-                        kb = get_kalshi_orderbook(kalshi_ticker.strip())
-                        k_bid, k_ask, k_no_bid, k_no_ask = best_kalshi_prices_from_book(kb)
-                        kalshi_prices = (k_bid, k_ask)
-                        st.metric("Best YES bid", fmt_price(k_bid) or "n/a")
-                        st.metric("Best YES ask", fmt_price(k_ask) or "n/a")
-                        st.write({"best_no_bid": fmt_price(k_no_bid), "best_no_ask": fmt_price(k_no_ask)})
-                    except Exception as e:
-                        st.error(f"Errore Kalshi: {e}")
-                else:
-                    st.info("Ticker Kalshi non inserito: mostro solo Polymarket.")
+            odds_df = flatten_odds(odds_events)
+            odds_best = best_odds_for_event(odds_df)
 
-            if poly_prices and kalshi_prices:
-                p_bid, p_ask = poly_prices
-                k_bid, k_ask = kalshi_prices
-                e1 = net_edge(p_ask, k_bid, buffer_bps)
-                e2 = net_edge(k_ask, p_bid, buffer_bps)
-                st.markdown("### Edge teorico al netto del buffer")
-                st.dataframe(pd.DataFrame([
-                    {"trade": "Buy YES Polymarket / Sell YES Kalshi", "edge": fmt_pct(e1)},
-                    {"trade": "Buy YES Kalshi / Sell YES Polymarket", "edge": fmt_pct(e2)},
-                ]), width="stretch", hide_index=True)
-                if any(x is not None and x > 0 for x in [e1, e2]):
-                    st.success("Possibile inefficienza. Verifica matching esatto, liquidita', fee, regole di settlement e reale esecuzione.")
-                else:
-                    st.info("Nessun edge positivo dopo il buffer impostato.")
+            st.caption(f"{len(odds_events)} eventi; {len(odds_df)} quote; {len(odds_best)} best prices.")
+            if quota:
+                st.caption(f"Quota: remaining={quota.get('requests_remaining')} used={quota.get('requests_used')} last={quota.get('requests_last')}")
 
-with tab_help:
-    st.subheader("Come leggere i risultati")
+            if not odds_best.empty:
+                show_cols = ["event", "start", "market_key", "outcome", "point", "best_bookmaker", "best_odds", "books_compared"]
+                st.dataframe(odds_best[show_cols].head(1000), width="stretch", hide_index=True)
+
+
+with tab_paper:
+    st.subheader("Paper Trade Log")
+
+    if not st.session_state.paper_trades:
+        st.info("Nessun paper trade ancora.")
+    else:
+        paper_df = pd.DataFrame(st.session_state.paper_trades)
+        st.dataframe(paper_df, width="stretch", hide_index=True)
+        st.download_button(
+            "Scarica paper trades CSV",
+            paper_df.to_csv(index=False).encode("utf-8"),
+            file_name="polyedge_paper_trades.csv",
+            mime="text/csv",
+        )
+
+        if st.button("Svuota paper log"):
+            st.session_state.paper_trades = []
+            st.rerun()
+
+
+with tab_setup:
+    st.subheader("Setup")
+
     st.markdown(
         """
-**Edge netto** = nella tabella principale e' il profitto netto teorico per contratto usando la logica YES+NO.
+### Streamlit secrets
 
-**Profitto stimato** = capitale per trade / costo per contratto * profitto per contratto.
+Aggiungi questa variabile nei secrets di Streamlit:
 
-**Trade YES+NO**:
-- Compra YES Polymarket + compra NO Kalshi
-- oppure compra YES Kalshi + compra NO Polymarket
+```toml
+ODDS_API_KEY = "la_tua_api_key"
+```
 
-NO ask e' stimato come `1 - YES bid` dell'altra piattaforma.
+### Metodo
 
-**Confidence** non garantisce che il mercato sia identico. Indica solo quanto i testi sembrano simili:
-- **Alta**: candidato buono, ma da verificare comunque.
-- **Media**: possibile, attenzione al wording.
-- **Bassa**: spesso falso positivo.
+Questa app non cerca più Kalshi. Usa:
 
-**Regola pratica:** ignora qualsiasi riga con confidence Bassa o prezzi 0.0000. Prima di mettere soldi, apri entrambi i link e controlla manualmente:
-1. stesso evento;
-2. stessa data/ora di settlement;
-3. stessa soglia numerica;
-4. stesso outcome YES/NO;
-5. liquidita' sufficiente per entrare e uscire;
-6. costi, spread e limiti account.
+```text
+Polymarket = mercato tradabile
+The Odds API = benchmark quote bookmaker
+```
 
-Questa app non piazza ordini e non promette profitto. Serve per trovare candidati da verificare.
+Il segnale principale è:
+
+```text
+edge = fair_probability_bookmaker_no_vig - polymarket_yes_ask
+```
+
+Se l'edge è positivo, Polymarket YES sembra più economico rispetto al benchmark bookmaker.
+
+### Trade automatici
+
+La versione attuale non invia ordini real-money. Genera:
+
+```text
+- segnale
+- link Polymarket
+- paper trade
+- CSV operativo
+```
+
+L'esecuzione automatica live va fatta solo con API ufficiali, chiavi custodite in ambiente privato, limiti di rischio e conferma esplicita.
         """
     )
