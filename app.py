@@ -16,7 +16,7 @@ import streamlit as st
 # Polymarket + bookmaker odds benchmark via The Odds API
 # ============================================================
 
-APP_VERSION = "PolyEdge Scanner v1.2 - block outright vs single-game mismatch"
+APP_VERSION = "PolyEdge Scanner v1.3 - strict date/team match for single games"
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
@@ -91,6 +91,30 @@ def short_time(iso_time: str) -> str:
         return str(iso_time or "")
 
 
+def iso_date_from_event_time(iso_time: Any) -> str:
+    try:
+        dt = datetime.fromisoformat(str(iso_time).replace("Z", "+00:00"))
+        return dt.date().isoformat()
+    except Exception:
+        return ""
+
+
+def extract_iso_dates(text: Any) -> set:
+    return set(re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", str(text or "")))
+
+
+def extract_poly_match_dates(row_or_text: Any) -> set:
+    if isinstance(row_or_text, dict):
+        text = " ".join([
+            str(row_or_text.get("question") or ""),
+            str(row_or_text.get("slug") or ""),
+            str(row_or_text.get("poly_slug") or ""),
+        ])
+    else:
+        text = str(row_or_text or "")
+    return extract_iso_dates(text)
+
+
 def implied_prob_from_decimal_odds(odds: Decimal) -> Optional[Decimal]:
     if odds <= 0:
         return None
@@ -146,8 +170,80 @@ TEAM_ALIASES = {
 }
 
 
+FIFA_CODE_MAP = {
+    "arg": "argentina",
+    "aus": "australia",
+    "aut": "austria",
+    "bel": "belgium",
+    "bih": "bosnia and herzegovina",
+    "bra": "brazil",
+    "can": "canada",
+    "che": "switzerland",
+    "civ": "ivory coast",
+    "col": "colombia",
+    "cpv": "cape verde",
+    "cro": "croatia",
+    "cuw": "curacao",
+    "cze": "czechia",
+    "deu": "germany",
+    "dza": "algeria",
+    "ecu": "ecuador",
+    "egy": "egypt",
+    "eng": "england",
+    "esp": "spain",
+    "fra": "france",
+    "ger": "germany",
+    "gha": "ghana",
+    "hai": "haiti",
+    "hti": "haiti",
+    "irn": "iran",
+    "irq": "iraq",
+    "jpn": "japan",
+    "kor": "south korea",
+    "kr": "south korea",
+    "ksa": "saudi arabia",
+    "mar": "morocco",
+    "mex": "mexico",
+    "nld": "netherlands",
+    "nor": "norway",
+    "nz": "new zealand",
+    "pan": "panama",
+    "par": "paraguay",
+    "pol": "poland",
+    "por": "portugal",
+    "prt": "portugal",
+    "qat": "qatar",
+    "rsa": "south africa",
+    "sco": "scotland",
+    "sen": "senegal",
+    "sui": "switzerland",
+    "swe": "sweden",
+    "tun": "tunisia",
+    "tur": "turkey",
+    "uru": "uruguay",
+    "usa": "united states",
+    "uzb": "uzbekistan",
+}
+
+
+def expand_codes_to_teams(text: Any) -> str:
+    """
+    Espande codici presenti negli slug Polymarket, esempio:
+    fifwc-col-prt-2026-06-27-prt -> colombia portugal 2026-06-27 portugal
+    """
+    raw = str(text or "").lower()
+    pieces = re.split(r"[^a-z0-9]+", raw)
+    expanded = []
+    for p in pieces:
+        if p in FIFA_CODE_MAP:
+            expanded.append(FIFA_CODE_MAP[p])
+        else:
+            expanded.append(p)
+    return " ".join(expanded)
+
+
 def canonical(s: Any) -> str:
-    text = normalize_text(s)
+    text = normalize_text(str(s or "") + " " + expand_codes_to_teams(s))
     for k, v in TEAM_ALIASES.items():
         text = re.sub(r"\b" + re.escape(k) + r"\b", v, text)
     return text
@@ -550,6 +646,7 @@ def flatten_odds(events: List[Dict[str, Any]]) -> pd.DataFrame:
                         "home_team": home,
                         "away_team": away,
                         "commence_time": commence,
+                        "event_date": iso_date_from_event_time(commence),
                         "start": short_time(commence),
                         "bookmaker": bookmaker,
                         "bookmaker_key": bookmaker_key,
@@ -571,9 +668,9 @@ def best_odds_for_event(df: pd.DataFrame) -> pd.DataFrame:
 
     rows = []
 
-    group_cols = ["event_id", "event", "home_team", "away_team", "start", "market_key", "outcome", "point"]
+    group_cols = ["event_id", "event", "home_team", "away_team", "event_date", "start", "market_key", "outcome", "point"]
     for keys, g in df.groupby(group_cols, dropna=False):
-        event_id, event, home, away, start, market_key, outcome, point = keys
+        event_id, event, home, away, event_date, start, market_key, outcome, point = keys
 
         best_idx = g["decimal_odds"].idxmax()
         best = g.loc[best_idx]
@@ -588,6 +685,7 @@ def best_odds_for_event(df: pd.DataFrame) -> pd.DataFrame:
             "event": event,
             "home_team": home,
             "away_team": away,
+            "event_date": event_date,
             "start": start,
             "market_key": market_key,
             "outcome": outcome,
@@ -638,13 +736,18 @@ def candidate_poly_questions(poly_markets: List[Dict[str, Any]]) -> pd.DataFrame
         volume = safe_float(m.get("volume24hr") or m.get("volume24hrClob") or m.get("volume") or 0) or 0
         liquidity = safe_float(m.get("liquidity") or m.get("liquidityNum") or 0) or 0
 
+        slug = m.get("slug") or ""
+        match_text = f"{question} {slug} {expand_codes_to_teams(slug)}"
+
         rows.append({
             "poly_id": m.get("id") or m.get("conditionId"),
             "question": question,
-            "market_type": poly_market_type(question),
+            "match_text": match_text,
+            "poly_dates": ",".join(sorted(extract_poly_match_dates({"question": question, "slug": slug}))),
+            "market_type": poly_market_type(match_text),
             "volume": volume,
             "liquidity": liquidity,
-            "slug": m.get("slug"),
+            "slug": slug,
             "token_yes": polymarket_yes_token(m),
             "raw": m,
         })
@@ -661,11 +764,13 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
 
     rows = []
 
-    odds_by_event = odds_best_df.groupby(["event_id", "event", "home_team", "away_team", "start"], dropna=False)
+    odds_by_event = odds_best_df.groupby(["event_id", "event", "home_team", "away_team", "event_date", "start"], dropna=False)
 
     count = 0
     for _, p in poly_df.head(max_candidates).iterrows():
         q = p["question"]
+        q_match_text = p.get("match_text") or q
+        poly_dates = set(str(p.get("poly_dates") or "").split(",")) if str(p.get("poly_dates") or "") else set()
         p_type = p["market_type"]
 
         if p_type in {"unknown", "outright"}:
@@ -674,9 +779,13 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
         if not looks_like_single_game_market(q):
             continue
 
-        for (event_id, event, home, away, start), eg in odds_by_event:
+        for (event_id, event, home, away, event_date, start), eg in odds_by_event:
             event_text = f"{event} {home} {away}"
-            sim = text_similarity(q, event_text)
+            sim = text_similarity(q_match_text, event_text)
+
+            # Regola fondamentale: se Polymarket contiene una data ISO, deve combaciare con la data evento bookmaker.
+            if poly_dates and event_date not in poly_dates:
+                continue
 
             # Evita confronti assurdi tra mercato stagionale e singola partita.
             # Ora richiediamo una similarita' minima piu' alta.
@@ -685,7 +794,7 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
 
             # Per h2h deve comparire almeno una delle due squadre dell'evento nella domanda Polymarket.
             if p_type == "h2h":
-                side_check = outcome_side_from_poly_question(q, home, away)
+                side_check = outcome_side_from_poly_question(q_match_text, home, away)
                 if not side_check:
                     continue
 
@@ -701,7 +810,7 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
             reason = ""
 
             if target_market == "h2h":
-                side = outcome_side_from_poly_question(q, home, away)
+                side = outcome_side_from_poly_question(q_match_text, home, away)
                 if side:
                     target_outcome = side
                     confidence = "Media" if sim >= Decimal("0.12") else "Bassa"
@@ -710,8 +819,8 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
                     continue
 
             elif target_market == "totals":
-                line = extract_total_line(q)
-                qn = canonical(q)
+                line = extract_total_line(q_match_text)
+                qn = canonical(q_match_text)
                 if line is None:
                     continue
 
@@ -774,6 +883,8 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
                 "poly_liquidity": p["liquidity"],
                 "poly_link": market_link_poly(p["raw"]),
                 "odds_event": event,
+                "event_date": event_date,
+                "poly_dates": ",".join(sorted(poly_dates)),
                 "event_start": start,
                 "odds_market": target_market,
                 "odds_outcome": best["outcome"],
@@ -1034,7 +1145,7 @@ with tab_scan:
                 else:
                     st.markdown("### Candidati matching")
                     cand_cols = [
-                        "confidence", "similarity", "polymarket_question", "odds_event", "event_start",
+                        "confidence", "similarity", "polymarket_question", "odds_event", "poly_dates", "event_date", "event_start",
                         "odds_market", "odds_outcome", "odds_point", "best_bookmaker", "best_odds",
                         "books_compared", "fair_probability", "poly_link"
                     ]
@@ -1049,7 +1160,7 @@ with tab_scan:
                         main_cols = [
                             "suggested_action", "confidence", "edge_vs_poly_ask_%", "estimated_ev_$",
                             "capital", "poly_ask", "poly_bid", "fair_probability_%",
-                            "polymarket_question", "odds_event", "event_start",
+                            "polymarket_question", "odds_event", "poly_dates", "event_date", "event_start",
                             "odds_outcome", "best_bookmaker", "best_odds",
                             "books_compared", "poly_link", "book_status"
                         ]
@@ -1176,6 +1287,8 @@ edge = fair_probability_bookmaker_no_vig - polymarket_yes_ask
 
 Importante: questa versione confronta solo mercati Polymarket che sembrano riferiti a singole partite/eventi.
 Mercati stagionali/outright come Championship, Super Bowl, division winner, MVP, World Cup winner vengono esclusi perché non sono confrontabili con quote h2h di una singola partita.
+
+Inoltre, se Polymarket contiene una data nel formato `YYYY-MM-DD`, l'evento bookmaker deve avere esattamente la stessa data. Questo evita confronti tipo "Portugal win on 2026-06-27" contro una partita del 2026-06-23.
 
 Se l'edge è positivo, Polymarket YES sembra più economico rispetto al benchmark bookmaker.
 
