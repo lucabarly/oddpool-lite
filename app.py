@@ -16,7 +16,7 @@ import streamlit as st
 # Polymarket + bookmaker odds benchmark via The Odds API
 # ============================================================
 
-APP_VERSION = "PolyEdge Scanner v1 - Polymarket + The Odds API benchmark"
+APP_VERSION = "PolyEdge Scanner v1.1 - Polymarket pagination hotfix + The Odds API benchmark"
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
@@ -231,7 +231,15 @@ def fetch_polymarket_markets(max_download: int, query: str = "") -> Tuple[List[D
 
         try:
             r = SESSION.get(f"{POLY_GAMMA}/markets", params=params, timeout=20)
-            r.raise_for_status()
+
+            # Gamma API puo' restituire 422 quando l'offset supera il range consentito.
+            # Se abbiamo gia' raccolto dati, non e' un errore operativo: interrompiamo la paginazione.
+            if r.status_code in (400, 404, 422) and results:
+                break
+
+            if r.status_code != 200:
+                return results, f"HTTP {r.status_code}: {r.text[:300]}"
+
             data = r.json()
             batch = data if isinstance(data, list) else data.get("markets", [])
             batch = [x for x in batch if isinstance(x, dict)]
@@ -246,6 +254,9 @@ def fetch_polymarket_markets(max_download: int, query: str = "") -> Tuple[List[D
                 break
 
         except Exception as e:
+            # Se abbiamo gia' scaricato risultati, usiamoli senza bloccare lo scanner.
+            if results:
+                break
             return results, str(e)
 
     return results, ""
