@@ -17,6 +17,7 @@ KALSHI_BASE_ALT = "https://external-api.kalshi.com/trade-api/v2"
 
 st.set_page_config(page_title="Oddpool Lite Scanner", layout="wide")
 st.title("Oddpool Lite - Scanner automatico opportunita'")
+st.caption("Versione aggiornata: debug matching + matching permissivo")
 st.caption(
     "Scanner gratuito Polymarket/Kalshi: trova mercati simili, legge top-of-book e calcola edge teorico. "
     "Non e' consulenza finanziaria e non esegue trade automatici."
@@ -586,7 +587,7 @@ with st.sidebar:
     top_poly = st.slider("Top Polymarket usati nello scanner", 20, 1500, 500, step=10)
     top_kalshi = st.slider("Top Kalshi usati nello scanner", 20, 3000, 1000, step=20)
     max_pairs = st.slider("Pair candidati da analizzare", 10, 1000, 300, step=10)
-    min_similarity = st.slider("Similarita' minima matching", 0.25, 0.85, 0.45, step=0.01)
+    min_similarity = st.slider("Similarita\' minima matching", 0.05, 0.85, 0.15, step=0.01)
     min_edge_pct = st.number_input("Mostra solo edge netto >= %", min_value=-20.0, max_value=20.0, value=0.0, step=0.1)
     buffer_bps = Decimal(str(st.number_input("Buffer fee/slippage, bps", min_value=0, max_value=1500, value=0, step=10)))
     read_orderbooks = st.checkbox("Leggi orderbook live", value=True)
