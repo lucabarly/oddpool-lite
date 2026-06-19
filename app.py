@@ -406,34 +406,48 @@ def quick_filter(query: str, m: Dict[str, Any]) -> bool:
 
 
 def candidate_pairs(poly_markets: List[Dict[str, Any]], kalshi_markets: List[Dict[str, Any]], min_similarity: float, max_pairs: int) -> List[Dict[str, Any]]:
+    """
+    Trova pair candidati in modo piu' permissivo e conserva anche candidati sotto soglia per debug.
+    """
     candidates = []
-    # Build rough inverted index for Kalshi to avoid full cartesian scan when possible.
+
     k_index: Dict[str, List[int]] = {}
     for i, km in enumerate(kalshi_markets):
-        for kw in list(keywords(text_of_market(km)))[:25]:
+        for kw in list(keywords(text_of_market(km)))[:30]:
             k_index.setdefault(kw, []).append(i)
 
     for pm in poly_markets:
         pm_text = text_of_market(pm)
         pm_keys = keywords(pm_text)
         possible_idx = set()
+
         for kw in pm_keys:
             possible_idx.update(k_index.get(kw, []))
+
         if not possible_idx:
-            possible_idx = set(range(min(len(kalshi_markets), 300)))
+            possible_idx = set(range(min(len(kalshi_markets), 800)))
 
         local = []
         for idx in possible_idx:
             km = kalshi_markets[idx]
             score, details = similarity(pm_text, text_of_market(km))
-            if score >= min_similarity:
-                local.append((score, details, km))
+            local.append((score, details, km))
+
         local.sort(key=lambda x: x[0], reverse=True)
-        for score, details, km in local[:3]:
-            candidates.append({"poly": pm, "kalshi": km, "similarity": score, "details": details})
+
+        for score, details, km in local[:5]:
+            candidates.append({
+                "poly": pm,
+                "kalshi": km,
+                "similarity": score,
+                "details": details,
+                "passes_similarity": score >= min_similarity,
+            })
 
     candidates.sort(key=lambda x: x["similarity"], reverse=True)
-    return candidates[:max_pairs]
+    passed = [c for c in candidates if c["passes_similarity"]]
+    debug = [c for c in candidates if not c["passes_similarity"]]
+    return (passed + debug)[:max_pairs]
 
 
 def scan_opportunities(
@@ -444,9 +458,19 @@ def scan_opportunities(
     buffer_bps: Decimal,
     min_edge: Decimal,
     read_orderbooks: bool,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Ritorna due tabelle:
+    - opportunita': solo pair con edge >= filtro e similarita' sopra soglia;
+    - debug: tutti i pair analizzati, inclusi quelli scartati, con motivo.
+    """
     pairs = candidate_pairs(poly_markets, kalshi_markets, min_similarity, max_pairs)
-    rows = []
+    opportunity_rows = []
+    debug_rows = []
+
+    if not pairs:
+        return pd.DataFrame(), pd.DataFrame()
+
     progress = st.progress(0, text="Analisi pair candidati...")
     total = max(1, len(pairs))
 
@@ -455,46 +479,61 @@ def scan_opportunities(
         km = pair["kalshi"]
         token = polymarket_yes_token(pm)
         ticker = km.get("ticker")
+
         p_bid = p_ask = p_bid_size = p_ask_size = None
         k_bid = k_ask = None
         status = "ok"
+        reject_reason = ""
 
         try:
             if token and read_orderbooks:
                 pb = get_poly_book(token)
                 p_bid, p_ask, p_bid_size, p_ask_size = best_poly_prices(pb)
+            elif not token:
+                reject_reason = "token Polymarket YES mancante"
         except Exception as e:
             status = f"Polymarket err: {str(e)[:80]}"
+            reject_reason = "errore orderbook Polymarket"
 
         try:
             k_bid, k_ask = best_kalshi_prices_from_market(km)
             if ticker and read_orderbooks and (k_bid is None or k_ask is None):
                 kb = get_kalshi_orderbook(ticker)
                 k_bid, k_ask, _, _ = best_kalshi_prices_from_book(kb)
+            elif not ticker:
+                reject_reason = reject_reason or "ticker Kalshi mancante"
         except Exception as e:
             status = f"Kalshi err: {str(e)[:80]}" if status == "ok" else status + " | Kalshi err"
+            reject_reason = reject_reason or "errore orderbook Kalshi"
 
         e1 = net_edge(p_ask, k_bid, buffer_bps)
         e2 = net_edge(k_ask, p_bid, buffer_bps)
+
         best_edge = None
         best_trade = ""
+
         if e1 is not None:
             best_edge = e1
             best_trade = "Compra YES Polymarket / vendi YES Kalshi"
+
         if e2 is not None and (best_edge is None or e2 > best_edge):
             best_edge = e2
             best_trade = "Compra YES Kalshi / vendi YES Polymarket"
 
-        if best_edge is not None and best_edge < min_edge:
-            progress.progress(n / total, text=f"Analisi pair {n}/{total}")
-            continue
+        if best_edge is None:
+            reject_reason = reject_reason or "prezzi bid/ask insufficienti"
+        elif best_edge < min_edge:
+            reject_reason = f"edge sotto filtro ({fmt_pct(best_edge)} < {fmt_pct(min_edge)})"
+        elif pair["similarity"] < min_similarity:
+            reject_reason = f"similarita sotto filtro ({pair['similarity']:.3f} < {min_similarity:.3f})"
 
-        rows.append({
+        base_row = {
             "edge_netto": float(best_edge) if best_edge is not None else None,
             "edge_netto_%": fmt_pct(best_edge),
             "trade": best_trade,
             "confidence": confidence(pair["similarity"], pair["details"]),
             "similarity": round(pair["similarity"], 3),
+            "passes_similarity": pair.get("passes_similarity", False),
             "polymarket": pm.get("question") or pm.get("title") or pm.get("eventTitle"),
             "kalshi": km.get("title") or km.get("subtitle") or km.get("ticker"),
             "poly_bid": fmt_price(p_bid),
@@ -503,21 +542,37 @@ def scan_opportunities(
             "kalshi_ask": fmt_price(k_ask),
             "poly_liquidity": to_float(pm.get("liquidity") or pm.get("liquidityNum")),
             "poly_volume24h": to_float(pm.get("volume24hr") or pm.get("volume24hrClob")),
+            "kalshi_volume": to_float(km.get("volume")),
+            "kalshi_liquidity": to_float(km.get("liquidity")),
             "kalshi_ticker": ticker,
             "poly_token_yes": token,
             "poly_link": market_link_poly(pm),
             "kalshi_link": market_link_kalshi(km),
             "matching_detail": json.dumps(pair["details"]),
             "status": status,
-        })
+            "motivo_scarto": reject_reason,
+        }
+
+        debug_rows.append(base_row)
+
+        if best_edge is not None and best_edge >= min_edge and pair["similarity"] >= min_similarity:
+            opportunity_rows.append(base_row)
+
         progress.progress(n / total, text=f"Analisi pair {n}/{total}")
-        time.sleep(0.02)
+        time.sleep(0.01)
 
     progress.empty()
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values(["edge_netto", "similarity"], ascending=[False, False], na_position="last")
-    return df
+
+    opp_df = pd.DataFrame(opportunity_rows)
+    debug_df = pd.DataFrame(debug_rows)
+
+    if not opp_df.empty:
+        opp_df = opp_df.sort_values(["edge_netto", "similarity"], ascending=[False, False], na_position="last")
+
+    if not debug_df.empty:
+        debug_df = debug_df.sort_values(["edge_netto", "similarity"], ascending=[False, False], na_position="last")
+
+    return opp_df, debug_df
 
 
 # -----------------------------
@@ -528,12 +583,12 @@ with st.sidebar:
     search = st.text_input("Filtro tema", value="", placeholder="bitcoin, btc, fed, trump, inflation...")
     poly_download = st.slider("Mercati Polymarket da scaricare", 500, 8000, 3000, step=500)
     kalshi_download = st.slider("Mercati Kalshi da scaricare", 100, 3000, 1000, step=100)
-    top_poly = st.slider("Top Polymarket usati nello scanner", 20, 500, 150, step=10)
-    top_kalshi = st.slider("Top Kalshi usati nello scanner", 20, 1000, 300, step=20)
-    max_pairs = st.slider("Pair candidati da analizzare", 10, 200, 50, step=10)
+    top_poly = st.slider("Top Polymarket usati nello scanner", 20, 1500, 500, step=10)
+    top_kalshi = st.slider("Top Kalshi usati nello scanner", 20, 3000, 1000, step=20)
+    max_pairs = st.slider("Pair candidati da analizzare", 10, 1000, 300, step=10)
     min_similarity = st.slider("Similarita' minima matching", 0.25, 0.85, 0.45, step=0.01)
     min_edge_pct = st.number_input("Mostra solo edge netto >= %", min_value=-20.0, max_value=20.0, value=0.0, step=0.1)
-    buffer_bps = Decimal(str(st.number_input("Buffer fee/slippage, bps", min_value=0, max_value=1500, value=50, step=10)))
+    buffer_bps = Decimal(str(st.number_input("Buffer fee/slippage, bps", min_value=0, max_value=1500, value=0, step=10)))
     read_orderbooks = st.checkbox("Leggi orderbook live", value=True)
     auto_refresh = st.checkbox("Auto-refresh 60 secondi", value=False)
     if st.button("Svuota cache / aggiorna dati"):
@@ -564,7 +619,7 @@ with tab_scan:
     if st.button("Avvia scanner", type="primary"):
         with st.spinner("Scarico mercati Polymarket e Kalshi..."):
             poly_all = get_polymarket_markets(search, poly_download)
-            kalshi_all = get_kalshi_markets(kalshi_download, search)
+            kalshi_all = get_kalshi_markets(kalshi_download, "")
 
             poly_filtered = [m for m in poly_all if quick_filter(search, m)] if search.strip() else poly_all
             kalshi_filtered = [m for m in kalshi_all if quick_filter(search, m)] if search.strip() else kalshi_all
@@ -577,16 +632,23 @@ with tab_scan:
             st.warning("Pochi dati trovati. Prova filtro vuoto oppure una keyword piu' ampia: crypto, election, fed, inflation.")
         else:
             min_edge = Decimal(str(min_edge_pct)) / Decimal("100")
-            df = scan_opportunities(poly_sorted, kalshi_sorted, min_similarity, max_pairs, buffer_bps, min_edge, read_orderbooks)
+            df, debug_df = scan_opportunities(poly_sorted, kalshi_sorted, min_similarity, max_pairs, buffer_bps, min_edge, read_orderbooks)
+
+            view_cols = [
+                "edge_netto_%", "trade", "confidence", "similarity", "polymarket", "kalshi",
+                "poly_bid", "poly_ask", "kalshi_bid", "kalshi_ask", "kalshi_ticker", "status"
+            ]
+
+            debug_cols = [
+                "edge_netto_%", "confidence", "similarity", "motivo_scarto", "polymarket", "kalshi",
+                "poly_bid", "poly_ask", "kalshi_bid", "kalshi_ask", "kalshi_ticker", "status", "matching_detail"
+            ]
+
             if df.empty:
-                st.warning("Nessuna opportunita' sopra i filtri impostati. Abbassa similarita'/edge minimo o usa filtro piu' ampio.")
+                st.warning("Nessuna opportunita' sopra i filtri impostati. Sotto trovi comunque i migliori pair candidati/debug.")
             else:
-                st.success(f"Trovate {len(df)} righe candidate. Ordinate per edge netto teorico.")
-                view_cols = [
-                    "edge_netto_%", "trade", "confidence", "similarity", "polymarket", "kalshi",
-                    "poly_bid", "poly_ask", "kalshi_bid", "kalshi_ask", "kalshi_ticker", "status"
-                ]
-                st.dataframe(df[view_cols], use_container_width=True, hide_index=True)
+                st.success(f"Trovate {len(df)} opportunita' candidate. Ordinate per edge netto teorico.")
+                st.dataframe(df[view_cols], width="stretch", hide_index=True)
                 st.download_button(
                     "Scarica CSV opportunita'",
                     df.to_csv(index=False).encode("utf-8"),
@@ -600,6 +662,21 @@ with tab_scan:
                         f"[Polymarket]({row['poly_link']}) | [Kalshi]({row['kalshi_link']}) | "
                         f"Ticker Kalshi: `{row['kalshi_ticker']}` | Token PM: `{row['poly_token_yes']}`"
                     )
+
+            st.markdown("### Debug matching - migliori pair analizzati")
+            st.caption(
+                "Questa tabella mostra anche i pair scartati. Serve per capire se il problema e' matching, orderbook, prezzi o edge sotto filtro."
+            )
+            if debug_df.empty:
+                st.info("Nessun pair candidato generato. Abbassa la similarita' minima o aumenta i mercati analizzati.")
+            else:
+                st.dataframe(debug_df[debug_cols], width="stretch", hide_index=True)
+                st.download_button(
+                    "Scarica CSV debug matching",
+                    debug_df.to_csv(index=False).encode("utf-8"),
+                    file_name="oddpool_lite_debug_matching.csv",
+                    mime="text/csv",
+                )
 
 with tab_poly:
     st.subheader("Mercati Polymarket")
@@ -621,7 +698,7 @@ with tab_poly:
             "endDate": m.get("endDate"),
             "link": market_link_poly(m),
         })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 with tab_kalshi:
     st.subheader("Mercati Kalshi")
@@ -643,7 +720,7 @@ with tab_kalshi:
             "close_time": m.get("close_time"),
             "link": market_link_kalshi(m),
         })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 with tab_manual:
     st.subheader("Scanner pair manuale")
@@ -689,7 +766,7 @@ with tab_manual:
                 st.dataframe(pd.DataFrame([
                     {"trade": "Buy YES Polymarket / Sell YES Kalshi", "edge": fmt_pct(e1)},
                     {"trade": "Buy YES Kalshi / Sell YES Polymarket", "edge": fmt_pct(e2)},
-                ]), use_container_width=True, hide_index=True)
+                ]), width="stretch", hide_index=True)
                 if any(x is not None and x > 0 for x in [e1, e2]):
                     st.success("Possibile inefficienza. Verifica matching esatto, liquidita', fee, regole di settlement e reale esecuzione.")
                 else:
