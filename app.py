@@ -4,6 +4,7 @@ import json
 import time
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -16,7 +17,7 @@ import streamlit as st
 # Polymarket + bookmaker odds benchmark via The Odds API
 # ============================================================
 
-APP_VERSION = "PolyEdge Scanner v1.4 - auto multi-sport + totals/BTTS/scorer matching"
+APP_VERSION = "PolyEdge Scanner v1.5 - event-date fix + event endpoint for extra markets"
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
@@ -126,6 +127,19 @@ def iso_date_from_event_time(iso_time: Any) -> str:
     try:
         dt = datetime.fromisoformat(str(iso_time).replace("Z", "+00:00"))
         return dt.date().isoformat()
+    except Exception:
+        return ""
+
+
+def iso_date_et_from_event_time(iso_time: Any) -> str:
+    """
+    The Odds API usa timestamp UTC.
+    Molti mercati Polymarket sportivi, specialmente World Cup/NFL/MLB, usano la data locale USA.
+    Esempio: 2026-06-20 00:30 UTC = 2026-06-19 sera in US/Eastern.
+    """
+    try:
+        dt = datetime.fromisoformat(str(iso_time).replace("Z", "+00:00"))
+        return dt.astimezone(ZoneInfo("America/New_York")).date().isoformat()
     except Exception:
         return ""
 
@@ -667,6 +681,52 @@ def fetch_odds(
         return [], {}, str(e)
 
 
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_event_odds(
+    api_key: str,
+    sport_key: str,
+    event_id: str,
+    regions: str,
+    markets: str,
+    odds_format: str,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]:
+    if not api_key:
+        return None, {}, "Missing API key"
+
+    params = {
+        "apiKey": api_key,
+        "regions": regions,
+        "markets": markets,
+        "oddsFormat": odds_format,
+        "dateFormat": "iso",
+    }
+
+    try:
+        r = SESSION.get(
+            f"{ODDS_API_BASE}/sports/{sport_key}/events/{event_id}/odds",
+            params=params,
+            timeout=30,
+        )
+
+        quota = {
+            "requests_remaining": r.headers.get("x-requests-remaining"),
+            "requests_used": r.headers.get("x-requests-used"),
+            "requests_last": r.headers.get("x-requests-last"),
+        }
+
+        if r.status_code != 200:
+            return None, quota, f"HTTP {r.status_code}: {r.text[:300]}"
+
+        data = r.json()
+        if not isinstance(data, dict):
+            return None, quota, "Unexpected event odds response"
+
+        return data, quota, ""
+
+    except Exception as e:
+        return None, {}, str(e)
+
+
 def fetch_odds_multi_sport(
     api_key: str,
     sport_keys: List[str],
@@ -674,11 +734,12 @@ def fetch_odds_multi_sport(
     core_markets: List[str],
     extra_markets: List[str],
     odds_format: str = "decimal",
+    max_extra_events_per_sport: int = 4,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
     """
     Scarica quote per piu' sport.
-    I mercati core vengono richiesti insieme.
-    I mercati extra vengono richiesti separatamente, e se falliscono non bloccano lo scanner.
+    Core markets: endpoint generale /odds.
+    Extra markets/player props: endpoint singolo evento /events/{eventId}/odds, limitato per quota/velocita'.
     """
     all_events = []
     quota_rows = []
@@ -689,7 +750,8 @@ def fetch_odds_multi_sport(
         if not sport_key:
             continue
 
-        # Core markets.
+        core_events = []
+
         if core_markets:
             events, quota, err = fetch_odds(
                 api_key,
@@ -701,30 +763,41 @@ def fetch_odds_multi_sport(
             if err:
                 errors.append(f"{sport_key} core: {err}")
             else:
+                core_events = events
                 all_events.extend(events)
-            if quota:
-                quota_rows.append({"sport": sport_key, **quota})
 
-        # Extra markets: try one by one, skip unsupported.
-        for mkt in extra_markets:
-            events, quota, err = fetch_odds(
-                api_key,
-                sport_key,
-                regions,
-                mkt,
-                odds_format,
-            )
-            if not err and events:
-                all_events.extend(events)
-            elif err:
-                # Keep only concise diagnostics.
-                errors.append(f"{sport_key} {mkt}: {err[:120]}")
             if quota:
-                quota_rows.append({"sport": sport_key, "market": mkt, **quota})
+                quota_rows.append({"sport": sport_key, "market": "core", **quota})
 
-    # Deduplicate events while preserving bookmaker market content is hard because the same event
-    # can be returned with different markets. We keep all and flatten later; duplicate rows are harmless.
+        # Extra markets: The Odds API spesso non li supporta su /odds.
+        # Li chiediamo solo per alcuni eventi tramite endpoint evento.
+        if extra_markets and core_events:
+            for ev in core_events[:max_extra_events_per_sport]:
+                event_id = ev.get("id")
+                if not event_id:
+                    continue
+
+                event_extra, quota, err = fetch_event_odds(
+                    api_key,
+                    sport_key,
+                    str(event_id),
+                    regions,
+                    ",".join(extra_markets),
+                    odds_format,
+                )
+
+                if not err and event_extra:
+                    all_events.append(event_extra)
+                elif err:
+                    # Non bloccare e non spammare l'utente: extra coverage e' variabile.
+                    if "INVALID_MARKET" not in err and "not supported" not in err.lower():
+                        errors.append(f"{sport_key} event {event_id} extra: {err[:120]}")
+
+                if quota:
+                    quota_rows.append({"sport": sport_key, "market": "extra_event", **quota})
+
     return all_events, quota_rows, errors
+
 
 
 def flatten_odds(events: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -765,6 +838,7 @@ def flatten_odds(events: List[Dict[str, Any]]) -> pd.DataFrame:
                         "away_team": away,
                         "commence_time": commence,
                         "event_date": iso_date_from_event_time(commence),
+                        "event_date_et": iso_date_et_from_event_time(commence),
                         "start": short_time(commence),
                         "bookmaker": bookmaker,
                         "bookmaker_key": bookmaker_key,
@@ -786,9 +860,9 @@ def best_odds_for_event(df: pd.DataFrame) -> pd.DataFrame:
 
     rows = []
 
-    group_cols = ["event_id", "event", "home_team", "away_team", "event_date", "start", "market_key", "outcome", "point"]
+    group_cols = ["event_id", "event", "home_team", "away_team", "event_date", "event_date_et", "start", "market_key", "outcome", "point"]
     for keys, g in df.groupby(group_cols, dropna=False):
-        event_id, event, home, away, event_date, start, market_key, outcome, point = keys
+        event_id, event, home, away, event_date, event_date_et, start, market_key, outcome, point = keys
 
         best_idx = g["decimal_odds"].idxmax()
         best = g.loc[best_idx]
@@ -804,6 +878,7 @@ def best_odds_for_event(df: pd.DataFrame) -> pd.DataFrame:
             "home_team": home,
             "away_team": away,
             "event_date": event_date,
+            "event_date_et": event_date_et,
             "start": start,
             "market_key": market_key,
             "outcome": outcome,
@@ -936,7 +1011,7 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
 
     rows = []
 
-    odds_by_event = odds_best_df.groupby(["event_id", "event", "home_team", "away_team", "event_date", "start"], dropna=False)
+    odds_by_event = odds_best_df.groupby(["event_id", "event", "home_team", "away_team", "event_date", "event_date_et", "start"], dropna=False)
 
     for _, p in poly_df.head(max_candidates).iterrows():
         q = p["question"]
@@ -954,12 +1029,13 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
         if not possible_markets:
             continue
 
-        for (event_id, event, home, away, event_date, start), eg in odds_by_event:
+        for (event_id, event, home, away, event_date, event_date_et, start), eg in odds_by_event:
             event_text = f"{event} {home} {away}"
             sim = text_similarity(q_match_text, event_text)
 
             # Date must match if Polymarket contains ISO date.
-            if poly_dates and event_date not in poly_dates:
+            # Accept UTC date OR US/Eastern date because many sports markets are labelled by local date.
+            if poly_dates and event_date not in poly_dates and event_date_et not in poly_dates:
                 continue
 
             if sim < Decimal("0.16"):
@@ -1042,6 +1118,7 @@ def match_poly_to_odds(poly_df: pd.DataFrame, odds_best_df: pd.DataFrame, max_ca
                     "poly_link": market_link_poly(p["raw"]),
                     "odds_event": event,
                     "event_date": event_date,
+                    "event_date_et": event_date_et,
                     "poly_dates": ",".join(sorted(poly_dates)),
                     "event_start": start,
                     "odds_market": target_market,
@@ -1233,6 +1310,15 @@ with st.sidebar:
         help="Disponibilita' variabile per sport/bookmaker/piano API. Se non supportati, vengono saltati."
     ) if use_extra_markets else []
 
+    max_extra_events_per_sport = st.slider(
+        "Eventi per sport da provare per mercati extra",
+        0,
+        20,
+        4,
+        step=1,
+        help="Limite per non consumare troppa quota. I mercati extra sono più costosi perché vanno richiesti evento per evento."
+    )
+
     st.divider()
 
     st.caption("Nota: questa versione esclude mercati stagionali/outright Polymarket. Confronta solo singole partite/eventi.")
@@ -1287,6 +1373,7 @@ with tab_scan:
                     core_markets_selected,
                     extra_markets_selected,
                     "decimal",
+                    max_extra_events_per_sport,
                 )
                 quota = quota_rows[-1] if quota_rows else {}
                 odds_err = ""
@@ -1294,9 +1381,9 @@ with tab_scan:
             if poly_err:
                 st.warning(f"Polymarket warning: {poly_err}")
             if odds_errors:
-                with st.expander("The Odds API: mercati/sport saltati"):
-                    st.write("Alcuni mercati extra o sport possono non essere disponibili con il piano/API corrente.")
-                    st.write(odds_errors[:50])
+                with st.expander("The Odds API: note tecniche"):
+                    st.write("Alcuni sport/mercati extra possono non essere disponibili con il piano/API corrente. Gli errori non bloccano lo scanner.")
+                    st.write(odds_errors[:30])
 
             poly_filtered = [m for m in poly_markets if is_relevant_poly_market(m, theme)]
             poly_df = candidate_poly_questions(poly_filtered).head(top_poly)
@@ -1328,7 +1415,7 @@ with tab_scan:
                 else:
                     st.markdown("### Candidati matching")
                     cand_cols = [
-                        "confidence", "similarity", "poly_market_type", "polymarket_question", "odds_event", "poly_dates", "event_date", "event_start",
+                        "confidence", "similarity", "poly_market_type", "polymarket_question", "odds_event", "poly_dates", "event_date", "event_date_et", "event_start",
                         "odds_market", "odds_outcome", "odds_point", "best_bookmaker", "best_odds",
                         "books_compared", "fair_probability", "poly_link"
                     ]
@@ -1343,7 +1430,7 @@ with tab_scan:
                         main_cols = [
                             "suggested_action", "confidence", "poly_market_type", "edge_vs_poly_ask_%", "estimated_ev_$",
                             "capital", "poly_ask", "poly_bid", "fair_probability_%",
-                            "polymarket_question", "odds_event", "poly_dates", "event_date", "event_start",
+                            "polymarket_question", "odds_event", "poly_dates", "event_date", "event_date_et", "event_start",
                             "odds_market", "odds_outcome", "best_bookmaker", "best_odds",
                             "books_compared", "poly_link", "book_status"
                         ]
@@ -1409,8 +1496,9 @@ with tab_odds:
         odds_err = ""
 
         if odds_errors:
-            with st.expander("The Odds API: mercati/sport saltati"):
-                st.write(odds_errors[:50])
+            with st.expander("The Odds API: note tecniche"):
+                st.write("Alcuni sport/mercati extra possono non essere disponibili con il piano/API corrente. Gli errori non bloccano lo scanner.")
+                st.write(odds_errors[:30])
         if True:
             odds_df = flatten_odds(odds_events)
             odds_best = best_odds_for_event(odds_df)
@@ -1466,7 +1554,9 @@ Polymarket = mercato tradabile
 The Odds API = benchmark quote bookmaker
 ```
 
-Da v1.4 non devi scegliere uno sport singolo: puoi usare Auto-scan multi-sport. L'app prova più sport e più mercati, inclusi risultato partita, over/under, spread, goal/no goal e scorer/player props quando disponibili.
+Da v1.5 non devi scegliere uno sport singolo: puoi usare Auto-scan multi-sport. L'app prova più sport e più mercati.
+
+I mercati core (`h2h`, `spreads`, `totals`) vengono richiesti dall'endpoint generale. I mercati extra/player props vengono provati tramite endpoint singolo evento, con un limite configurabile per non consumare troppa quota.
 
 Il segnale principale è:
 
