@@ -13,7 +13,7 @@ import requests
 import streamlit as st
 
 
-APP_VERSION = "PolyKalshi Edge Scanner v3.4 - fast candidate matching + orderbooks after match"
+APP_VERSION = "PolyKalshi Edge Scanner v3.6 - tested quality gates + composite filter"
 
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
@@ -194,24 +194,41 @@ def extract_years_set(s: str) -> set:
 
 def compact_entity_tokens(s: str) -> set:
     """
-    Tokens used for entity overlap. Removes common market words.
+    Tokens used for entity overlap.
+    v3.5: removes dates/categories/generic words so date-only matches no longer pass.
     """
     bad = STOPWORDS | {
         "above", "below", "over", "under", "yes", "no", "before", "after",
         "january", "february", "march", "april", "june", "july", "august",
         "september", "october", "november", "december", "jan", "feb", "mar",
         "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+        "sport", "sports", "other", "politics", "crypto", "economy", "weather",
+        "target", "price", "market", "markets", "kalshi", "polymarket",
     }
-    return {t for t in tokens(s) if t not in bad and not re.fullmatch(r"\d+(?:\.\d+)?", t)}
+
+    out = set()
+    for t in tokens(s):
+        if t in bad:
+            continue
+        if re.fullmatch(r"\d+(?:\.\d+)?", t):
+            continue
+        if re.fullmatch(r"20\d{2}[-_/]\d{1,2}[-_/]\d{1,2}", t):
+            continue
+        if re.fullmatch(r"20\d{2}", t):
+            continue
+        if len(t) <= 2:
+            continue
+        out.add(t)
+    return out
 
 
 def matching_text_from_market_row(row: Dict[str, Any]) -> str:
+    # Do not include category/date as text. They are handled separately.
+    # Including them caused false positives based only on "sport" or "2026-06-22".
     fields = [
         row.get("title", ""),
         row.get("ticker", ""),
-        row.get("category", ""),
-        row.get("event_date", ""),
-        row.get("dates_in_title", ""),
+        row.get("matching_text", ""),
     ]
     return " ".join(str(x or "") for x in fields)
 
@@ -284,10 +301,11 @@ def structured_score(poly_row: Dict[str, Any], kalshi_row: Dict[str, Any]) -> Tu
         score *= 0.50
         reasons.append("year_mismatch=*0.50")
 
-    # Need at least one meaningful shared entity unless lexical score is very high.
-    if not shared_entities and base < 0.72:
-        score *= 0.50
-        reasons.append("no_shared_entity=*0.50")
+    # Need at least one meaningful shared entity unless lexical score is extremely high.
+    # v3.5: date/category matches are not enough.
+    if not shared_entities and base < 0.85:
+        score *= 0.20
+        reasons.append("no_shared_entity=*0.20")
 
     score = max(0.0, min(1.0, score))
     if shared_entities:
@@ -720,6 +738,175 @@ def outcome_type_ok(a: pd.Series, b: pd.Series) -> bool:
     return oa == ob
 
 
+def is_kalshi_composite_row(row: Dict[str, Any]) -> bool:
+    """
+    Hard filter for Kalshi rows that are not comparable single binary markets.
+    The uploaded diagnostics show many false matches from:
+    - KXMVESPORTSMULTIGAMEEXTENDED...
+    - KXMVECROSSCATEGORY...
+    - titles like "yes Target Price: ... , yes Target Price: ..."
+    These are composite/bundled/structured outcome markets and should not be matched
+    against a single Polymarket binary question.
+    """
+    ticker = str(row.get("ticker") or "").upper()
+    title = str(row.get("title") or "")
+    raw = str(row.get("raw") or "")
+    text = f"{title} {ticker} {raw}".lower()
+
+    bad_ticker_parts = [
+        "KXMVESPORTSMULTIGAME",
+        "KXMVESPORTSMULTIGAMEEXTENDED",
+        "KXMVECROSSCATEGORY",
+        "MULTIGAME",
+        "CROSSCATEGORY",
+        "CROSS_CATEGORY",
+        "PARLAY",
+        "COMBO",
+        "BUNDLE",
+    ]
+    if any(x in ticker for x in bad_ticker_parts):
+        return True
+
+    if "target price:" in text:
+        return True
+
+    # Multiple explicit yes/no outcomes in a single title is a bundle/list, not a clean binary question.
+    yes_no_count = len(re.findall(r"\b(?:yes|no)\b", text))
+    if yes_no_count >= 3:
+        return True
+
+    # Comma-separated outcome lists are usually composite.
+    if title.count(",") >= 2 and yes_no_count >= 2:
+        return True
+
+    # Long titles with repeated market components are not clean.
+    repeated_components = len(re.findall(r"\b(over|under|wins by|both teams to score|target price|yes|no)\b", text))
+    if repeated_components >= 5:
+        return True
+
+    return False
+
+
+def filter_kalshi_single_binary(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if df.empty:
+        return df, pd.DataFrame()
+
+    mask_bad = df.apply(lambda r: is_kalshi_composite_row(r.to_dict()), axis=1)
+    removed = df[mask_bad].copy()
+    clean = df[~mask_bad].copy()
+    return clean, removed
+
+
+def run_quality_self_tests() -> pd.DataFrame:
+    """
+    Built-in quality tests. These are not market predictions; they validate that the
+    scanner rejects the exact false-positive patterns we saw in diagnostics.
+    """
+    tests = []
+
+    def record(name: str, passed: bool, details: str):
+        tests.append({"test": name, "passed": bool(passed), "details": details})
+
+    bad_kalshi_1 = {
+        "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026621F49BF751",
+        "title": "yes Target Price: $0.0841401,yes Target Price: $1,762.02",
+        "raw": "{}",
+    }
+    bad_kalshi_2 = {
+        "ticker": "KXMVECROSSCATEGORY-S202610254C3B8E7",
+        "title": "yes Los Angeles A,yes Jo Adell: 1+",
+        "raw": "{}",
+    }
+    good_kalshi = {
+        "ticker": "KXBTC-2026-06-30-T100000",
+        "title": "Bitcoin above $100,000 on June 30, 2026",
+        "raw": "{}",
+    }
+
+    record(
+        "reject multigame target-price Kalshi",
+        is_kalshi_composite_row(bad_kalshi_1),
+        "KXMVESPORTSMULTIGAMEEXTENDED + Target Price must be removed",
+    )
+    record(
+        "reject crosscategory Kalshi",
+        is_kalshi_composite_row(bad_kalshi_2),
+        "KXMVECROSSCATEGORY must be removed",
+    )
+    record(
+        "allow clean single binary Kalshi",
+        not is_kalshi_composite_row(good_kalshi),
+        "simple Bitcoin binary should survive composite filter",
+    )
+
+    ents = compact_entity_tokens("sport other 2026-06-22 Exact Score Argentina Austria")
+    record(
+        "date/category not entity",
+        "sport" not in ents and "other" not in ents and "2026" not in ents and "2026-06-22" not in ents,
+        f"entities={sorted(ents)}",
+    )
+
+    poly_good = {
+        "title": "Will Bitcoin be above $100,000 on June 30, 2026?",
+        "matching_text": "Will Bitcoin be above $100,000 on June 30, 2026? bitcoin btc",
+        "ticker": "bitcoin-100000-june-30-2026",
+        "category": "crypto",
+        "outcome_type": "over",
+        "event_date": "2026-06-30",
+        "dates_in_title": "2026-06-30",
+    }
+    kalshi_good = {
+        "title": "Bitcoin above $100,000 on June 30, 2026",
+        "matching_text": "Bitcoin above $100,000 on June 30, 2026 KXBTC",
+        "ticker": "KXBTC-2026-06-30-T100000",
+        "category": "crypto",
+        "outcome_type": "over",
+        "event_date": "2026-06-30",
+        "dates_in_title": "2026-06-30",
+    }
+    score_good, reason_good = structured_score(poly_good, kalshi_good)
+    record(
+        "high score for obvious clean match",
+        score_good >= 0.65,
+        f"score={score_good:.3f}; {reason_good}",
+    )
+
+    poly_bad = {
+        "title": "Exact Score: Argentina 2 - 1 Austria?",
+        "matching_text": "Exact Score Argentina 2 1 Austria 2026-06-22 sport",
+        "ticker": "fifwc-arg-aut-2026-06-22-exact-score-2-1",
+        "category": "sport",
+        "outcome_type": "binary",
+        "event_date": "2026-06-22",
+        "dates_in_title": "2026-06-22",
+    }
+    kalshi_bad = {
+        "title": "KXMVESPORTSMULTIGAMEEXTENDED-S2026BE1E7871186 yes Target Price: $0.0841401,yes Target Price: $1.1455",
+        "matching_text": "KXMVESPORTSMULTIGAMEEXTENDED-S2026BE1E7871186 yes Target Price: $0.0841401,yes Target Price: $1.1455",
+        "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026BE1E7871186",
+        "category": "sport",
+        "outcome_type": "binary",
+        "event_date": "2026-06-22",
+        "dates_in_title": "2026-06-22",
+    }
+    score_bad, reason_bad = structured_score(poly_bad, kalshi_bad)
+    record(
+        "low score for diagnostic false-positive pattern",
+        score_bad < 0.40 and is_kalshi_composite_row(kalshi_bad),
+        f"score={score_bad:.3f}; composite={is_kalshi_composite_row(kalshi_bad)}; {reason_bad}",
+    )
+
+    sample_df = pd.DataFrame([bad_kalshi_1, bad_kalshi_2, good_kalshi])
+    clean, removed = filter_kalshi_single_binary(sample_df)
+    record(
+        "filter removes bad and keeps good",
+        len(clean) == 1 and len(removed) == 2,
+        f"clean={len(clean)}, removed={len(removed)}",
+    )
+
+    return pd.DataFrame(tests)
+
+
 def rough_candidate_score(p_meta: Dict[str, Any], k_meta: Dict[str, Any], same_category: bool, require_date_match: bool) -> float:
     """
     Very fast pre-score used only to choose candidate pairs before the expensive structured_score.
@@ -762,7 +949,7 @@ def rough_candidate_score(p_meta: Dict[str, Any], k_meta: Dict[str, Any], same_c
             score -= 0.25
 
     if not shared:
-        score -= 0.20
+        score -= 0.60
 
     return score
 
@@ -851,6 +1038,7 @@ def build_matches(
     max_candidates_per_poly: int = 80,
     fallback_candidates: int = 120,
     exhaustive_matching: bool = False,
+    require_shared_entity: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     v3.4 performance matcher:
@@ -913,6 +1101,9 @@ def build_matches(
                 continue
 
             if not outcome_type_ok(pser, kser):
+                continue
+
+            if require_shared_entity and not (p_meta["entities"] & kalshi_meta[idx]["entities"]):
                 continue
 
             rs = rough_candidate_score(p_meta, kalshi_meta[idx], same_category, require_date_match)
@@ -1139,6 +1330,12 @@ st.set_page_config(page_title="PolyKalshi Edge Scanner", layout="wide")
 st.title("PolyKalshi Edge Scanner")
 st.caption(APP_VERSION)
 
+_startup_tests = run_quality_self_tests()
+if int(_startup_tests["passed"].sum()) != len(_startup_tests):
+    st.error("ATTENZIONE: test qualità scanner falliti. Non usare i risultati finché non vengono corretti.")
+else:
+    st.caption(f"Quality gate OK: {len(_startup_tests)}/{len(_startup_tests)} test superati.")
+
 st.warning(
     "Trade automatici real-money: disabilitati. Questa app genera segnali, normalizzazione prezzi e paper trade plan. "
     "Non inserire private key o credenziali trading in Streamlit Cloud."
@@ -1205,6 +1402,18 @@ with st.sidebar:
         help="Disattivato di default: le date di chiusura/settlement possono differire anche per eventi simili."
     )
 
+    exclude_composite_kalshi = st.checkbox(
+        "Escludi Kalshi composite/multigame/crosscategory",
+        value=True,
+        help="Fondamentale: elimina KXMVESPORTSMULTIGAME, KXMVECROSSCATEGORY, Target Price e liste yes/no."
+    )
+
+    require_shared_entity = st.checkbox(
+        "Richiedi almeno una entità condivisa",
+        value=True,
+        help="Evita match basati solo su data/categoria. Consigliato."
+    )
+
     max_matches = st.slider("Massimo match da mostrare", 20, 3000, 500, step=20)
     capital = dec(st.number_input("Capitale per strategia ($)", min_value=1.0, max_value=100000.0, value=100.0, step=25.0))
     min_roi = dec(st.number_input("ROI minimo arbitraggio (%)", min_value=0.0, max_value=50.0, value=1.0, step=0.10)) / Decimal("100")
@@ -1222,7 +1431,7 @@ with st.sidebar:
     st.caption("Kalshi: se il primo endpoint non risponde, l'app prova automaticamente l'altro base URL pubblico.")
 
 
-tab_scan, tab_poly, tab_kalshi, tab_setup = st.tabs(["Scanner", "Polymarket", "Kalshi", "Setup"])
+tab_scan, tab_poly, tab_kalshi, tab_tests, tab_setup = st.tabs(["Scanner", "Polymarket", "Kalshi", "Test qualità", "Setup"])
 
 
 with tab_scan:
@@ -1258,14 +1467,26 @@ with tab_scan:
         with st.spinner("Normalizzo Kalshi..."):
             kalshi_df = kalshi_to_rows(kalshi_markets)
 
+        removed_kalshi_df = pd.DataFrame()
+        if exclude_composite_kalshi:
+            kalshi_df, removed_kalshi_df = filter_kalshi_single_binary(kalshi_df)
+
         if category_filter:
             poly_df = poly_df[poly_df["category"].isin(category_filter)].copy()
             kalshi_df = kalshi_df[kalshi_df["category"].isin(category_filter)].copy()
 
+        removed_msg = f"; {len(removed_kalshi_df)} Kalshi composite rimossi" if exclude_composite_kalshi else ""
         st.info(
-            f"Dataset normalizzato: {len(poly_df)} Polymarket su {len(poly_markets)} scaricati; {len(kalshi_df)} Kalshi su {len(kalshi_markets)} scaricati. "
+            f"Dataset normalizzato: {len(poly_df)} Polymarket su {len(poly_markets)} scaricati; "
+            f"{len(kalshi_df)} Kalshi puliti su {len(kalshi_markets)} scaricati{removed_msg}. "
             f"Prezzi in scala 0..1."
         )
+
+        if exclude_composite_kalshi and not removed_kalshi_df.empty:
+            with st.expander("Kalshi rimossi come composite/multigame/crosscategory"):
+                removed_cols = ["ticker", "title", "event_date", "url"]
+                available_removed_cols = [c for c in removed_cols if c in removed_kalshi_df.columns]
+                st.dataframe(removed_kalshi_df[available_removed_cols].head(200), width="stretch", hide_index=True)
 
         if poly_df.empty:
             st.error("Nessun mercato Polymarket dopo filtri.")
@@ -1284,6 +1505,7 @@ with tab_scan:
                     max_candidates_per_poly=max_candidates_per_poly,
                     fallback_candidates=fallback_candidates,
                     exhaustive_matching=exhaustive_matching,
+                    require_shared_entity=require_shared_entity,
                 )
 
             if matches.empty:
@@ -1381,10 +1603,27 @@ with tab_kalshi:
         if base:
             st.caption(f"Base URL: {base}")
         df = kalshi_to_rows(markets)
+        removed = pd.DataFrame()
+        if exclude_composite_kalshi:
+            df, removed = filter_kalshi_single_binary(df)
+            st.caption(f"Kalshi composite rimossi: {len(removed)}")
         if category_filter:
             df = df[df["category"].isin(category_filter)].copy()
         cols = ["category", "title", "event_date", "yes_bid", "yes_ask", "no_bid", "no_ask", "volume", "liquidity", "url", "book_status"]
         st.dataframe(pretty_prices(df)[cols].head(1000), width="stretch", hide_index=True)
+
+
+with tab_tests:
+    st.subheader("Test qualità scanner")
+    st.caption("Questi test controllano automaticamente i falsi positivi che abbiamo visto: multigame, crosscategory, Target Price e match basati solo su data/categoria.")
+    tests_df = run_quality_self_tests()
+    passed_count = int(tests_df["passed"].sum()) if not tests_df.empty else 0
+    total_count = len(tests_df)
+    if passed_count == total_count:
+        st.success(f"Test automatici superati: {passed_count}/{total_count}")
+    else:
+        st.error(f"Test automatici falliti: {passed_count}/{total_count}")
+    st.dataframe(tests_df, width="stretch", hide_index=True)
 
 
 with tab_setup:
@@ -1392,6 +1631,22 @@ with tab_setup:
 
     st.markdown(
         """
+### Fix v3.6
+
+Test automatici integrati:
+- blocco multigame/crosscategory/Target Price;
+- date/categorie non contano come entità;
+- match Bitcoin pulito deve passare;
+- falso positivo Argentina/KXMVESPORTSMULTIGAME deve fallire.
+
+### Fix v3.5
+
+Qualità matching:
+- elimina Kalshi `KXMVESPORTSMULTIGAME...`, `KXMVECROSSCATEGORY...`, `Target Price`, liste di outcome `yes/no`;
+- non considera più data/categoria come entità utili per il matching;
+- penalizza molto i match senza entità reali condivise;
+- aggiunge tabella dei Kalshi rimossi.
+
 ### Fix v3.4
 
 Performance:
