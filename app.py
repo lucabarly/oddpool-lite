@@ -13,7 +13,7 @@ import requests
 import streamlit as st
 
 
-APP_VERSION = "PolyKalshi Edge Scanner v3.1 - fixed Polymarket pagination >100"
+APP_VERSION = "PolyKalshi Edge Scanner v3.2 - wider matching + diagnostics"
 
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
@@ -597,11 +597,33 @@ def outcome_type_ok(a: pd.Series, b: pd.Series) -> bool:
     return oa == ob
 
 
-def build_matches(poly_df: pd.DataFrame, kalshi_df: pd.DataFrame, min_similarity: float, max_matches: int, same_category: bool) -> pd.DataFrame:
+def build_matches(
+    poly_df: pd.DataFrame,
+    kalshi_df: pd.DataFrame,
+    min_similarity: float,
+    max_matches: int,
+    same_category: bool,
+    require_date_match: bool = False,
+    diagnostic_limit: int = 100,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Wider matcher.
+
+    v3.1 was too strict:
+    - required shared tokens before scoring
+    - often required same estimated category
+    - date check was effectively too aggressive for markets that close/settle on different dates
+
+    v3.2:
+    - scores candidates even without shared token overlap
+    - category/date are optional filters only
+    - returns diagnostics with best near-matches below threshold
+    """
     rows = []
+    diagnostic_rows = []
 
     if poly_df.empty or kalshi_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     poly_records = list(poly_df.to_dict("records"))
     kalshi_records = list(kalshi_df.to_dict("records"))
@@ -612,37 +634,67 @@ def build_matches(poly_df: pd.DataFrame, kalshi_df: pd.DataFrame, min_similarity
     for i, p in enumerate(poly_records, start=1):
         pser = pd.Series(p)
 
-        # Fast candidate cut by category and shared tokens.
-        p_tokens = set(tokens(p["title"]))
         candidates = kalshi_records
         if same_category:
             candidates = [k for k in candidates if k.get("category") == p.get("category")]
 
         scored = []
+        p_title = p.get("title", "")
+        p_tokens = set(tokens(p_title))
+
         for k in candidates:
             kser = pd.Series(k)
-            if not date_match_ok(pser, kser):
+
+            if require_date_match and not date_match_ok(pser, kser):
                 continue
+
             if not outcome_type_ok(pser, kser):
                 continue
 
-            k_tokens = set(tokens(k["title"]))
-            if p_tokens and k_tokens and not (p_tokens & k_tokens):
-                # still allow generic high sequence matches only rarely
-                seq = SequenceMatcher(None, normalize_text_for_match(p["title"]), normalize_text_for_match(k["title"])).ratio()
-                if seq < 0.72:
-                    continue
+            k_title = k.get("title", "")
+            k_tokens = set(tokens(k_title))
+            shared = p_tokens & k_tokens
 
-            sim = text_similarity(p["title"], k["title"])
-            if sim >= min_similarity:
-                scored.append((sim, k))
+            sim = text_similarity(p_title, k_title)
+
+            if shared:
+                sim = min(1.0, sim + min(0.10, len(shared) * 0.015))
+
+            if p.get("category") == k.get("category"):
+                sim = min(1.0, sim + 0.03)
+
+            if date_match_ok(pser, kser):
+                sim = min(1.0, sim + 0.02)
+
+            scored.append((sim, k, ",".join(sorted(list(shared))[:12])))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        for sim, k in scored[:3]:
+
+        if scored:
+            sim, k, shared_words = scored[0]
+            diagnostic_rows.append({
+                "similarity": sim,
+                "category_poly": p.get("category"),
+                "category_kalshi": k.get("category"),
+                "shared_words": shared_words,
+                "poly_title": p.get("title"),
+                "kalshi_title": k.get("title"),
+                "poly_date": p.get("event_date"),
+                "kalshi_date": k.get("event_date"),
+                "poly_url": p.get("url"),
+                "kalshi_url": k.get("url"),
+            })
+
+        for sim, k, shared_words in scored[:5]:
+            if sim < min_similarity:
+                continue
+
             rows.append({
                 "similarity": sim,
-                "confidence": "Alta" if sim >= 0.78 else ("Media" if sim >= 0.68 else "Bassa"),
+                "confidence": "Alta" if sim >= 0.78 else ("Media" if sim >= 0.62 else "Bassa"),
                 "category": p.get("category"),
+                "kalshi_category": k.get("category"),
+                "shared_words": shared_words,
                 "outcome_type": p.get("outcome_type"),
                 "poly_title": p.get("title"),
                 "kalshi_title": k.get("title"),
@@ -668,12 +720,19 @@ def build_matches(poly_df: pd.DataFrame, kalshi_df: pd.DataFrame, min_similarity
 
             if len(rows) >= max_matches:
                 progress.empty()
-                return pd.DataFrame(rows)
+                diag = pd.DataFrame(diagnostic_rows)
+                if not diag.empty:
+                    diag = diag.sort_values("similarity", ascending=False).head(diagnostic_limit)
+                return pd.DataFrame(rows), diag
 
         progress.progress(i / total, text=f"Matching {i}/{total}")
 
     progress.empty()
-    return pd.DataFrame(rows)
+    match_df = pd.DataFrame(rows)
+    diag_df = pd.DataFrame(diagnostic_rows)
+    if not diag_df.empty:
+        diag_df = diag_df.sort_values("similarity", ascending=False).head(diagnostic_limit)
+    return match_df, diag_df
 
 
 def arbitrage_plan(price_a: Decimal, price_b: Decimal, capital: Decimal, leg_a: str, leg_b: str) -> Dict[str, Any]:
@@ -836,9 +895,19 @@ with st.sidebar:
     max_poly_books = st.slider("Max orderbook Polymarket da leggere", 50, 3000, 800, step=50)
 
     min_similarity = st.slider("Similarità minima matching", 0.40, 0.95, 0.68, step=0.01)
-    same_category = st.checkbox("Richiedi stessa categoria stimata", value=True)
+    same_category = st.checkbox(
+        "Richiedi stessa categoria stimata",
+        value=False,
+        help="Disattivato di default: le categorie sono stimate e possono essere diverse tra Kalshi e Polymarket."
+    )
 
-    max_matches = st.slider("Massimo match da mostrare", 20, 2000, 300, step=20)
+    require_date_match = st.checkbox(
+        "Richiedi stessa data",
+        value=False,
+        help="Disattivato di default: le date di chiusura/settlement possono differire anche per eventi simili."
+    )
+
+    max_matches = st.slider("Massimo match da mostrare", 20, 3000, 500, step=20)
     capital = dec(st.number_input("Capitale per strategia ($)", min_value=1.0, max_value=100000.0, value=100.0, step=25.0))
     min_roi = dec(st.number_input("ROI minimo arbitraggio (%)", min_value=0.0, max_value=50.0, value=1.0, step=0.10)) / Decimal("100")
 
@@ -904,14 +973,37 @@ with tab_scan:
             st.error("Nessun mercato Kalshi dopo filtri.")
         else:
             with st.spinner("Cerco match cross-platform..."):
-                matches = build_matches(poly_df, kalshi_df, min_similarity, max_matches, same_category)
+                matches, diagnostics = build_matches(
+                    poly_df,
+                    kalshi_df,
+                    min_similarity,
+                    max_matches,
+                    same_category,
+                    require_date_match,
+                    diagnostic_limit=100,
+                )
 
             if matches.empty:
-                st.warning("Nessun match trovato. Abbassa similarità, togli stessa categoria, o usa un filtro testo più specifico.")
+                st.warning("Nessun match sopra la soglia. Qui sotto trovi i migliori quasi-match per capire se la soglia è troppo alta o se i dataset sono davvero diversi.")
+                if not diagnostics.empty:
+                    diag_cols = [
+                        "similarity", "category_poly", "category_kalshi", "shared_words",
+                        "poly_title", "kalshi_title", "poly_date", "kalshi_date", "poly_url", "kalshi_url"
+                    ]
+                    st.markdown("### Diagnostica migliori quasi-match")
+                    st.dataframe(diagnostics[diag_cols].head(100), width="stretch", hide_index=True)
             else:
+                if 'diagnostics' in locals() and not diagnostics.empty:
+                    with st.expander("Diagnostica migliori quasi-match"):
+                        diag_cols = [
+                            "similarity", "category_poly", "category_kalshi", "shared_words",
+                            "poly_title", "kalshi_title", "poly_date", "kalshi_date", "poly_url", "kalshi_url"
+                        ]
+                        st.dataframe(diagnostics[diag_cols].head(100), width="stretch", hide_index=True)
+
                 st.markdown("### Match trovati")
                 match_cols = [
-                    "confidence", "similarity", "category", "outcome_type",
+                    "confidence", "similarity", "category", "kalshi_category", "shared_words", "outcome_type",
                     "poly_title", "kalshi_title", "poly_date", "kalshi_date",
                     "poly_yes_ask", "poly_no_ask", "kalshi_yes_ask", "kalshi_no_ask",
                     "poly_url", "kalshi_url"
@@ -923,7 +1015,7 @@ with tab_scan:
 
                 show_cols = [
                     "azione_operativa", "roi_%", "profitto_teorico_$", "costo_combo", "payout_garantito_$",
-                    "confidence", "similarity", "category", "outcome_type",
+                    "confidence", "similarity", "category", "kalshi_category", "shared_words", "outcome_type",
                     "poly_title", "kalshi_title",
                     "poly_yes_ask", "poly_no_ask", "kalshi_yes_ask", "kalshi_no_ask",
                     "best_yes_platform", "best_yes_price", "best_no_platform", "best_no_price",
@@ -991,6 +1083,14 @@ with tab_setup:
 
     st.markdown(
         """
+### Fix v3.2
+
+Il matching ora è molto meno rigido:
+- stessa categoria disattivata di default;
+- stessa data disattivata di default;
+- nessuno scarto automatico se non ci sono parole identiche;
+- tabella diagnostica dei migliori quasi-match anche sotto soglia.
+
 ### Fix v3.1
 
 La paginazione Polymarket ora usa batch da 100 e continua fino al limite impostato nello slider. Prima chiedeva 500 mercati, Gamma ne restituiva 100, e l'app si fermava erroneamente a 100.
