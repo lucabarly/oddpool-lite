@@ -13,7 +13,7 @@ import requests
 import streamlit as st
 
 
-APP_VERSION = "PolyKalshi Edge Scanner v3.0 - normalized binary cross-market scanner"
+APP_VERSION = "PolyKalshi Edge Scanner v3.1 - fixed Polymarket pagination >100"
 
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
@@ -269,9 +269,23 @@ def mid_from_bid_ask(bid: Optional[Decimal], ask: Optional[Decimal]) -> Optional
 
 @st.cache_data(ttl=90, show_spinner=False)
 def fetch_polymarket_markets(limit_total: int, search: str = "") -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Polymarket Gamma pagination fix.
+
+    Gamma often returns max ~100 markets per page even if a larger limit is requested.
+    Previous versions requested 500 and stopped when 100 came back, incorrectly assuming
+    there were no more pages. This version requests 100 per page and keeps paging until:
+    - requested limit_total is reached
+    - an empty page is returned
+    - a repeated page/offset situation is detected
+    - Gamma returns 422 after we already have data
+    """
     out = []
     offset = 0
-    batch = 500
+    batch = 100
+    seen_ids = set()
+    pages = 0
+
     try:
         while len(out) < limit_total:
             params = {
@@ -286,19 +300,40 @@ def fetch_polymarket_markets(limit_total: int, search: str = "") -> Tuple[List[D
                 params["search"] = search
 
             r = SESSION.get(f"{POLY_GAMMA}/markets", params=params, timeout=25)
+
             if r.status_code == 422 and out:
-                break
+                return out, f"Pagination stopped after {len(out)} markets: Gamma returned 422 at offset {offset}."
             if r.status_code != 200:
                 return out, f"HTTP {r.status_code}: {r.text[:300]}"
+
             data = r.json()
             if not isinstance(data, list) or not data:
                 break
-            out.extend(data)
-            if len(data) < params["limit"]:
-                break
+
+            pages += 1
+            added_this_page = 0
+
+            for m in data:
+                mid = str(m.get("id") or m.get("conditionId") or m.get("slug") or "")
+                if mid and mid in seen_ids:
+                    continue
+                if mid:
+                    seen_ids.add(mid)
+                out.append(m)
+                added_this_page += 1
+                if len(out) >= limit_total:
+                    break
+
+            # If Gamma repeats a page or all records were duplicates, avoid infinite loop.
+            if added_this_page == 0:
+                return out, f"Pagination stopped after {len(out)} markets: repeated/duplicate page at offset {offset}."
+
+            # Advance by the actual number returned by the API page, not by requested limit.
             offset += len(data)
+
             time.sleep(0.03)
-        return out, ""
+
+        return out, f"Downloaded {len(out)} Polymarket markets in {pages} pages."
     except Exception as e:
         return out, str(e)
 
@@ -839,7 +874,10 @@ with tab_scan:
             kalshi_markets, kalshi_err, kalshi_base = fetch_kalshi_markets(kalshi_limit, search)
 
         if poly_err:
-            st.warning(f"Polymarket warning: {poly_err}")
+            if str(poly_err).startswith("Downloaded"):
+                st.caption(f"Polymarket: {poly_err}")
+            else:
+                st.warning(f"Polymarket warning: {poly_err}")
         if kalshi_err:
             st.warning(f"Kalshi warning: {kalshi_err}")
         if kalshi_base:
@@ -856,7 +894,7 @@ with tab_scan:
             kalshi_df = kalshi_df[kalshi_df["category"].isin(category_filter)].copy()
 
         st.info(
-            f"Dataset normalizzato: {len(poly_df)} Polymarket; {len(kalshi_df)} Kalshi. "
+            f"Dataset normalizzato: {len(poly_df)} Polymarket su {len(poly_markets)} scaricati; {len(kalshi_df)} Kalshi su {len(kalshi_markets)} scaricati. "
             f"Prezzi in scala 0..1."
         )
 
@@ -922,7 +960,10 @@ with tab_poly:
     if st.button("Carica Polymarket", key="load_poly"):
         markets, err = fetch_polymarket_markets(poly_limit, search)
         if err:
-            st.warning(err)
+            if str(err).startswith("Downloaded"):
+                st.caption(f"Polymarket: {err}")
+            else:
+                st.warning(err)
         df = polymarket_to_rows(markets, read_poly_books, max_poly_books)
         if category_filter:
             df = df[df["category"].isin(category_filter)].copy()
@@ -950,6 +991,10 @@ with tab_setup:
 
     st.markdown(
         """
+### Fix v3.1
+
+La paginazione Polymarket ora usa batch da 100 e continua fino al limite impostato nello slider. Prima chiedeva 500 mercati, Gamma ne restituiva 100, e l'app si fermava erroneamente a 100.
+
 ### Logica normalizzata
 
 Ogni mercato viene trasformato in questo schema comune:
