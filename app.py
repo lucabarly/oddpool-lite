@@ -17,10 +17,11 @@ import streamlit as st
 # Polymarket + bookmaker odds benchmark via The Odds API
 # ============================================================
 
-APP_VERSION = "PolyEdge Scanner v1.8 - explicit YES/NO hedge instructions"
+APP_VERSION = "PolyEdge Scanner v2.1 - quota saver does not alter results"
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+ODDS_API_IO_BASE = "https://api.odds-api.io/v3"
 
 DEFAULT_AUTO_SPORTS = [
     "soccer_epl",
@@ -52,6 +53,31 @@ EXTRA_MARKETS = [
     "player_rebounds",
     "player_assists",
 ]
+
+
+def is_quota_expensive_or_outright_sport_key(sport_key: str) -> bool:
+    k = str(sport_key or "").lower()
+    bad_parts = [
+        "_winner",
+        "championship_winner",
+        "super_bowl_winner",
+        "world_series_winner",
+        "world_cup_winner",
+        "politics_",
+        "golf_",
+    ]
+    return any(x in k for x in bad_parts)
+
+
+def quota_remaining_low(quota_rows: List[Dict[str, Any]], threshold: int = 5) -> bool:
+    if not quota_rows:
+        return False
+    last = quota_rows[-1].get("requests_remaining")
+    try:
+        return int(last) <= threshold
+    except Exception:
+        return False
+
 
 st.set_page_config(
     page_title="PolyEdge Scanner",
@@ -667,6 +693,205 @@ def is_relevant_poly_market(m: Dict[str, Any], theme: str) -> bool:
 # Odds API
 # ============================================================
 
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_sports_odds_api_io(api_key: str) -> Tuple[List[str], str]:
+    try:
+        params = {"apiKey": api_key} if api_key else {}
+        r = SESSION.get(f"{ODDS_API_IO_BASE}/sports", params=params, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}: {r.text[:300]}"
+        data = r.json()
+        raw = data
+        if isinstance(data, dict):
+            raw = data.get("sports") or data.get("data") or data.get("items") or []
+        keys = []
+        if isinstance(raw, list):
+            for x in raw:
+                if isinstance(x, str):
+                    keys.append(x)
+                elif isinstance(x, dict):
+                    keys.append(str(x.get("key") or x.get("id") or x.get("slug") or x.get("name") or ""))
+        return sorted([x for x in keys if x]), ""
+    except Exception as e:
+        return [], str(e)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_events_odds_api_io(api_key: str, sport: str, limit: int = 5) -> Tuple[List[Dict[str, Any]], str]:
+    if not api_key:
+        return [], "Missing ODDS_API_IO_KEY"
+    try:
+        r = SESSION.get(
+            f"{ODDS_API_IO_BASE}/events",
+            params={"apiKey": api_key, "sport": sport, "limit": limit},
+            timeout=25,
+        )
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}: {r.text[:300]}"
+        data = r.json()
+        raw = data if isinstance(data, list) else data.get("events") or data.get("data") or data.get("items") or []
+        if not isinstance(raw, list):
+            return [], "Unexpected events response"
+        return [x for x in raw if isinstance(x, dict)], ""
+    except Exception as e:
+        return [], str(e)
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_event_odds_odds_api_io(api_key: str, event_id: str) -> Tuple[Any, str]:
+    if not api_key:
+        return None, "Missing ODDS_API_IO_KEY"
+    try:
+        r = SESSION.get(
+            f"{ODDS_API_IO_BASE}/odds",
+            params={"apiKey": api_key, "eventId": event_id},
+            timeout=25,
+        )
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}: {r.text[:300]}"
+        return r.json(), ""
+    except Exception as e:
+        return None, str(e)
+
+
+def odds_api_io_event_label(ev: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
+    event_id = str(ev.get("id") or ev.get("eventId") or ev.get("event_id") or "")
+    home = str(ev.get("home") or ev.get("homeTeam") or ev.get("home_team") or "")
+    away = str(ev.get("away") or ev.get("awayTeam") or ev.get("away_team") or "")
+    participants = ev.get("participants") or ev.get("teams") or []
+    if (not home or not away) and isinstance(participants, list) and len(participants) >= 2:
+        a, b = participants[0], participants[1]
+        away = away or (str(a.get("name") or a.get("team") or "") if isinstance(a, dict) else str(a))
+        home = home or (str(b.get("name") or b.get("team") or "") if isinstance(b, dict) else str(b))
+    title = str(ev.get("name") or ev.get("title") or ev.get("eventName") or "")
+    if not title and home and away:
+        title = f"{away} @ {home}"
+    start = str(ev.get("startTime") or ev.get("commence_time") or ev.get("start_time") or ev.get("date") or ev.get("start") or "")
+    return event_id, title, home, away, start
+
+
+def extract_decimal_odds_value(obj: Dict[str, Any]) -> Optional[Decimal]:
+    for k in ["odds", "price", "decimalOdds", "decimal_odds", "value"]:
+        if k in obj:
+            v = dec(obj.get(k), "0")
+            if v > 1:
+                return v
+    for k in ["americanOdds", "american_odds"]:
+        if k in obj:
+            a = dec(obj.get(k), "0")
+            if a > 0:
+                return Decimal("1") + (a / Decimal("100"))
+            if a < 0:
+                return Decimal("1") + (Decimal("100") / abs(a))
+    return None
+
+
+def flatten_odds_api_io_response(events: List[Dict[str, Any]], odds_payloads: Dict[str, Any], sport_key: str) -> pd.DataFrame:
+    rows = []
+    event_meta = {}
+    for ev in events:
+        event_id, title, home, away, start = odds_api_io_event_label(ev)
+        if event_id:
+            event_meta[event_id] = {
+                "event": title,
+                "home_team": home,
+                "away_team": away,
+                "commence_time": start,
+                "event_date": iso_date_from_event_time(start),
+                "event_date_et": iso_date_et_from_event_time(start),
+                "start": short_time(start),
+            }
+
+    def normalize_market(m):
+        mn = canonical(m)
+        if "moneyline" in mn or "match winner" in mn or mn in {"h2h", "ml"}:
+            return "h2h"
+        if "total" in mn or "over under" in mn or "over/under" in mn:
+            return "totals"
+        if "both teams to score" in mn or "btts" in mn:
+            return "btts"
+        return str(m or "h2h")
+
+    def walk(obj, ctx):
+        if isinstance(obj, dict):
+            c = dict(ctx)
+            bookmaker = obj.get("bookmaker") or obj.get("bookmakerName") or obj.get("sportsbook") or obj.get("bookmakerTitle")
+            if bookmaker:
+                c["bookmaker"] = str(bookmaker)
+            market = obj.get("market") or obj.get("marketName") or obj.get("marketType") or obj.get("market_key")
+            if market:
+                c["market_key"] = normalize_market(market)
+            outcome = obj.get("outcome") or obj.get("selection") or obj.get("label") or obj.get("participantName") or obj.get("name")
+            if outcome:
+                c["outcome"] = str(outcome)
+            if obj.get("point") is not None or obj.get("line") is not None or obj.get("handicap") is not None:
+                c["point"] = obj.get("point") if obj.get("point") is not None else (obj.get("line") if obj.get("line") is not None else obj.get("handicap"))
+
+            odds = extract_decimal_odds_value(obj)
+            if odds and c.get("bookmaker") and c.get("outcome"):
+                meta = event_meta.get(c.get("event_id"), {})
+                implied = implied_prob_from_decimal_odds(odds)
+                rows.append({
+                    "event_id": c.get("event_id"),
+                    "sport_key": sport_key,
+                    "sport_title": sport_key,
+                    "event": meta.get("event", c.get("event_id")),
+                    "home_team": meta.get("home_team", ""),
+                    "away_team": meta.get("away_team", ""),
+                    "commence_time": meta.get("commence_time", ""),
+                    "event_date": meta.get("event_date", ""),
+                    "event_date_et": meta.get("event_date_et", ""),
+                    "start": meta.get("start", ""),
+                    "bookmaker": c.get("bookmaker"),
+                    "bookmaker_key": c.get("bookmaker"),
+                    "last_update": "",
+                    "market_key": c.get("market_key", "h2h"),
+                    "market": c.get("market_key", "h2h"),
+                    "outcome": c.get("outcome"),
+                    "point": c.get("point"),
+                    "decimal_odds": float(odds),
+                    "implied_probability": float(implied or Decimal("0")),
+                    "provider": "Odds-API.io",
+                })
+            for v in obj.values():
+                walk(v, c)
+        elif isinstance(obj, list):
+            for x in obj:
+                walk(x, ctx)
+
+    for event_id, payload in odds_payloads.items():
+        walk(payload, {"event_id": event_id})
+
+    return pd.DataFrame(rows)
+
+
+def fetch_odds_api_io_multi_sport(api_key: str, sport_keys: List[str], max_events_per_sport: int) -> Tuple[pd.DataFrame, List[str]]:
+    all_events = []
+    payloads = {}
+    errors = []
+    by_sport = {}
+    for sport in sport_keys:
+        events, err = fetch_events_odds_api_io(api_key, sport, max_events_per_sport)
+        if err:
+            errors.append(f"{sport} events: {err[:160]}")
+            continue
+        by_sport[sport] = events
+        for ev in events[:max_events_per_sport]:
+            event_id, _, _, _, _ = odds_api_io_event_label(ev)
+            if not event_id:
+                continue
+            payload, err = fetch_event_odds_odds_api_io(api_key, event_id)
+            if err:
+                errors.append(f"{sport} event {event_id} odds: {err[:160]}")
+                continue
+            payloads[event_id] = payload
+
+    dfs = [flatten_odds_api_io_response(evs, payloads, sport) for sport, evs in by_sport.items()]
+    dfs = [d for d in dfs if not d.empty]
+    return (pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()), errors
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_sports(api_key: str) -> Tuple[List[Dict[str, Any]], str]:
     if not api_key:
@@ -781,9 +1006,10 @@ def fetch_odds_multi_sport(
     max_extra_events_per_sport: int = 4,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
     """
-    Scarica quote per piu' sport.
+    Scarica quote per piu' sport senza bruciare crediti inutilmente.
     Core markets: endpoint generale /odds.
-    Extra markets/player props: endpoint singolo evento /events/{eventId}/odds, limitato per quota/velocita'.
+    Extra markets/player props: endpoint evento, limitato.
+    Stop immediato se The Odds API segnala OUT_OF_USAGE_CREDITS.
     """
     all_events = []
     quota_rows = []
@@ -793,6 +1019,10 @@ def fetch_odds_multi_sport(
         sport_key = str(sport_key).strip()
         if not sport_key:
             continue
+
+        if quota_saver_mode and quota_remaining_low(quota_rows, threshold=3):
+            errors.append("Stop automatico: crediti The Odds API quasi finiti.")
+            break
 
         core_events = []
 
@@ -804,19 +1034,26 @@ def fetch_odds_multi_sport(
                 ",".join(core_markets),
                 odds_format,
             )
-            if err:
-                errors.append(f"{sport_key} core: {err}")
-            else:
-                core_events = events
-                all_events.extend(events)
 
             if quota:
                 quota_rows.append({"sport": sport_key, "market": "core", **quota})
 
-        # Extra markets: The Odds API spesso non li supporta su /odds.
-        # Li chiediamo solo per alcuni eventi tramite endpoint evento.
-        if extra_markets and core_events:
+            if err:
+                if "OUT_OF_USAGE_CREDITS" in err:
+                    errors.append("OUT_OF_USAGE_CREDITS: crediti The Odds API esauriti. Fermato lo scanner per non fare richieste inutili.")
+                    break
+                if "INVALID_MARKET_COMBO" not in err:
+                    errors.append(f"{sport_key} core: {err[:160]}")
+            else:
+                core_events = events
+                all_events.extend(events)
+
+        if extra_markets and core_events and (not quota_saver_mode or not quota_remaining_low(quota_rows, threshold=10)):
             for ev in core_events[:max_extra_events_per_sport]:
+                if quota_saver_mode and quota_remaining_low(quota_rows, threshold=3):
+                    errors.append("Stop extra markets: crediti The Odds API quasi finiti.")
+                    break
+
                 event_id = ev.get("id")
                 if not event_id:
                     continue
@@ -830,15 +1067,17 @@ def fetch_odds_multi_sport(
                     odds_format,
                 )
 
-                if not err and event_extra:
-                    all_events.append(event_extra)
-                elif err:
-                    # Non bloccare e non spammare l'utente: extra coverage e' variabile.
-                    if "INVALID_MARKET" not in err and "not supported" not in err.lower():
-                        errors.append(f"{sport_key} event {event_id} extra: {err[:120]}")
-
                 if quota:
                     quota_rows.append({"sport": sport_key, "market": "extra_event", **quota})
+
+                if err:
+                    if "OUT_OF_USAGE_CREDITS" in err:
+                        errors.append("OUT_OF_USAGE_CREDITS durante extra markets. Fermato lo scanner.")
+                        break
+                    if "INVALID_MARKET" not in err and "not supported" not in err.lower() and "INVALID_MARKET_COMBO" not in err:
+                        errors.append(f"{sport_key} event {event_id} extra: {err[:160]}")
+                elif event_extra:
+                    all_events.append(event_extra)
 
     return all_events, quota_rows, errors
 
@@ -1746,6 +1985,30 @@ def add_paper_trade(row: Dict[str, Any], stake: Decimal):
     st.session_state.paper_trades.append(trade)
 
 
+
+def fetch_provider_flat_odds_for_ui() -> Tuple[pd.DataFrame, List[Dict[str, Any]], List[str], Dict[str, Any]]:
+    if odds_provider == "The Odds API":
+        odds_events, quota_rows, errors = fetch_odds_multi_sport(
+            odds_api_key,
+            selected_sports,
+            ",".join(regions),
+            core_markets_selected,
+            extra_markets_selected,
+            "decimal",
+            max_extra_events_per_sport,
+        )
+        odds_df = flatten_odds(odds_events)
+        quota = quota_rows[-1] if quota_rows else {}
+        return odds_df, quota_rows, errors, quota
+
+    odds_df, errors = fetch_odds_api_io_multi_sport(
+        odds_api_io_key,
+        selected_sports,
+        max_events_per_sport_provider,
+    )
+    return odds_df, [], errors, {}
+
+
 # ============================================================
 # UI
 # ============================================================
@@ -1768,6 +2031,13 @@ st.warning(
 with st.sidebar:
     st.header("Input")
 
+    odds_provider = st.selectbox(
+        "Provider quote",
+        ["The Odds API", "Odds-API.io"],
+        index=0,
+        help="The Odds API = provider storico. Odds-API.io = alternativa gratuita/sperimentale."
+    )
+
     odds_api_key = st.text_input(
         "The Odds API key",
         value=get_secret_or_env("ODDS_API_KEY", ""),
@@ -1775,36 +2045,95 @@ with st.sidebar:
         help="Per usarla in cloud, aggiungi ODDS_API_KEY nei secrets di Streamlit.",
     )
 
+    odds_api_io_key = st.text_input(
+        "Odds-API.io key",
+        value=get_secret_or_env("ODDS_API_IO_KEY", ""),
+        type="password",
+        help="Per usarla in cloud, aggiungi ODDS_API_IO_KEY nei secrets di Streamlit.",
+    )
+
+    active_odds_key = odds_api_key if odds_provider == "The Odds API" else odds_api_io_key
+
     if st.button("Svuota cache / aggiorna dati"):
         st.cache_data.clear()
         st.success("Cache svuotata. Rilancia lo scanner.")
 
     st.divider()
 
+    quota_saver_mode = st.checkbox(
+        "Protezione crediti API",
+        value=True,
+        help="Non cambia i risultati. Ferma solo lo scanner quando i crediti sono quasi finiti, evitando richieste inutili."
+    )
+
+    exclude_outright_sports = st.checkbox(
+        "Escludi sport winner/outright",
+        value=True,
+        help="Filtro esplicito. Consigliato per questa app: gli sport *_winner non sono comparabili con mercati full-game h2h/totals."
+    )
+
     auto_multi_sport = st.checkbox("Auto-scan multi-sport", value=True)
 
-    sports, sports_err = fetch_sports(odds_api_key) if odds_api_key else ([], "")
-
     available_sport_keys = []
-    if sports:
-        active = [s for s in sports if s.get("active", True)]
-        available_sport_keys = [str(s.get("key")) for s in active if s.get("key")]
+    sports_err = ""
+
+    if odds_provider == "The Odds API":
+        sports, sports_err = fetch_sports(odds_api_key) if odds_api_key else ([], "")
+        if sports:
+            active = [s for s in sports if s.get("active", True)]
+            available_sport_keys = [str(s.get("key")) for s in active if s.get("key")]
     else:
+        available_sport_keys, sports_err = fetch_sports_odds_api_io(odds_api_io_key) if odds_api_io_key else ([], "")
+
+    if not available_sport_keys:
         available_sport_keys = DEFAULT_AUTO_SPORTS
         if sports_err:
             st.caption(f"Sports API: {sports_err}")
 
-    default_auto = [s for s in DEFAULT_AUTO_SPORTS if s in available_sport_keys]
+    if exclude_outright_sports:
+        available_sport_keys = [s for s in available_sport_keys if not is_quota_expensive_or_outright_sport_key(s)]
+
+    preferred_safe_default = [
+        "soccer_fifa_world_cup",
+        "soccer_epl",
+        "soccer_italy_serie_a",
+        "baseball_mlb",
+        "americanfootball_nfl",
+    ]
+    default_auto = [s for s in preferred_safe_default if s in available_sport_keys]
     if not default_auto:
-        default_auto = available_sport_keys[:8]
+        default_auto = [s for s in DEFAULT_AUTO_SPORTS if s in available_sport_keys][:5]
+    if not default_auto:
+        default_auto = available_sport_keys[:3]
+
+    max_sports_per_run = st.slider(
+        "Avviso se sport selezionati superano",
+        1,
+        50,
+        5,
+        step=1,
+        help="Solo avviso: non taglia i risultati. Serve a ricordarti che piu' sport consumano piu' crediti."
+    )
+
+    max_events_per_sport_provider = st.slider(
+        "Max eventi per sport provider alternativo",
+        1,
+        20,
+        5,
+        step=1,
+        help="Usato soprattutto da Odds-API.io: limita chiamate per non sprecare quota."
+    )
 
     if auto_multi_sport:
-        selected_sports = st.multiselect(
+        selected_sports_raw = st.multiselect(
             "Sport da scansionare automaticamente",
             available_sport_keys,
-            default=default_auto[:8],
-            help="Puoi lasciarlo automatico. Meno sport = piu' veloce; piu' sport = piu' copertura."
+            default=default_auto,
+            help="Seleziona gli sport che vuoi davvero scansionare. La protezione crediti NON taglia questa lista."
         )
+        selected_sports = selected_sports_raw
+        if len(selected_sports_raw) > max_sports_per_run:
+            st.warning(f"Hai selezionato {len(selected_sports_raw)} sport. Non verranno tagliati, ma consumerai piu' crediti API.")
     else:
         selected_sport = st.selectbox("Sport The Odds API", available_sport_keys, index=0)
         selected_sports = [selected_sport]
@@ -1817,7 +2146,11 @@ with st.sidebar:
         help="h2h = risultato, totals = over/under, spreads = handicap/spread"
     )
 
-    use_extra_markets = st.checkbox("Prova mercati extra: goal/no goal, scorer, player props", value=True)
+    use_extra_markets = st.checkbox(
+        "Prova mercati extra: goal/no goal, scorer, player props",
+        value=False,
+        help="Scelta esplicita: se attivo aumenta la copertura, ma consuma piu' richieste API."
+    )
     extra_markets_selected = st.multiselect(
         "Mercati extra",
         EXTRA_MARKETS,
@@ -1830,9 +2163,9 @@ with st.sidebar:
         "Eventi per sport da provare per mercati extra",
         0,
         20,
-        4,
+        0,
         step=1,
-        help="Limite per non consumare troppa quota. I mercati extra sono più costosi perché vanno richiesti evento per evento."
+        help="Scelta esplicita: piu' eventi extra = piu' copertura e piu' consumo API."
     )
 
     st.divider()
@@ -1846,6 +2179,15 @@ with st.sidebar:
     st.divider()
 
     capital = dec(st.number_input("Capitale per trade ($)", min_value=1.0, max_value=100000.0, value=100.0, step=25.0))
+
+    estimated_fx_roundtrip_pct = st.number_input(
+        "Costo cambio/prelievo stimato round-trip (%)",
+        min_value=0.0,
+        max_value=20.0,
+        value=1.5,
+        step=0.10,
+        help="Per Italia/EUR: costo totale stimato EUR->USD/USDC e USD/USDC->EUR. Cerca ROI sopra questo costo."
+    )
     min_edge_pct = st.number_input("Edge minimo vs Polymarket ask (%)", min_value=-50.0, max_value=50.0, value=2.0, step=0.25)
     min_edge = dec(min_edge_pct) / Decimal("100")
 
@@ -1884,8 +2226,14 @@ tab_scan, tab_poly, tab_odds, tab_arb, tab_paper, tab_setup = st.tabs([
 with tab_scan:
     st.subheader("Scanner Polymarket vs bookmaker benchmark")
 
-    if not odds_api_key:
-        st.error("Inserisci una The Odds API key nella sidebar o nei secrets Streamlit come ODDS_API_KEY.")
+    if quota_saver_mode:
+        st.caption("Protezione crediti API attiva: non modifica i risultati, ferma solo richieste inutili se i crediti sono quasi finiti.")
+    if exclude_outright_sports:
+        st.caption("Filtro esplicito winner/outright attivo.")
+    st.caption(f"Provider quote: {odds_provider}. Costo cambio/prelievo round-trip stimato: {estimated_fx_roundtrip_pct:.2f}%. Cerca ROI superiore a questo costo + margine sicurezza.")
+
+    if not active_odds_key:
+        st.error("Inserisci la API key del provider selezionato nella sidebar o nei secrets Streamlit.")
     elif not regions or not core_markets_selected:
         st.error("Seleziona almeno una regione e almeno un mercato core.")
     elif not selected_sports:
@@ -1894,16 +2242,8 @@ with tab_scan:
         if st.button("Avvia scanner", type="primary"):
             with st.spinner("Scarico dati..."):
                 poly_markets, poly_err = fetch_polymarket_markets(poly_download, theme)
-                odds_events, quota_rows, odds_errors = fetch_odds_multi_sport(
-                    odds_api_key,
-                    selected_sports,
-                    ",".join(regions),
-                    core_markets_selected,
-                    extra_markets_selected,
-                    "decimal",
-                    max_extra_events_per_sport,
-                )
-                quota = quota_rows[-1] if quota_rows else {}
+                odds_df, quota_rows, odds_errors, quota = fetch_provider_flat_odds_for_ui()
+                odds_events = []
                 odds_err = ""
 
             if poly_err:
@@ -1915,12 +2255,11 @@ with tab_scan:
 
             poly_filtered = [m for m in poly_markets if is_relevant_poly_market(m, theme)]
             poly_df = candidate_poly_questions(poly_filtered).head(top_poly)
-            odds_df = flatten_odds(odds_events)
             odds_best = best_odds_for_event(odds_df)
 
             st.info(
                 f"Dataset: {len(poly_df)} Polymarket analizzati su {len(poly_markets)} scaricati; "
-                f"{len(odds_events)} eventi odds da {len(selected_sports)} sport; {len(odds_df)} quote bookmaker."
+                f"provider {odds_provider}; {len(selected_sports)} sport; {len(odds_df)} quote bookmaker normalizzate."
             )
 
             if quota_rows:
@@ -2023,18 +2362,11 @@ with tab_poly:
 with tab_odds:
     st.subheader("Bookmaker odds via The Odds API")
 
-    if not odds_api_key:
-        st.error("Inserisci The Odds API key.")
+    if not active_odds_key:
+        st.error("Inserisci la API key del provider selezionato.")
     elif st.button("Carica bookmaker odds", key="load_odds"):
-        odds_events, quota_rows, odds_errors = fetch_odds_multi_sport(
-            odds_api_key,
-            selected_sports,
-            ",".join(regions),
-            core_markets_selected,
-            extra_markets_selected,
-            "decimal",
-        )
-        quota = quota_rows[-1] if quota_rows else {}
+        odds_df, quota_rows, odds_errors, quota = fetch_provider_flat_odds_for_ui()
+        odds_events = []
         odds_err = ""
 
         if odds_errors:
@@ -2042,10 +2374,9 @@ with tab_odds:
                 st.write("Alcuni sport/mercati extra possono non essere disponibili con il piano/API corrente. Gli errori non bloccano lo scanner.")
                 st.write(odds_errors[:30])
         if True:
-            odds_df = flatten_odds(odds_events)
             odds_best = best_odds_for_event(odds_df)
 
-            st.caption(f"{len(odds_events)} eventi; {len(odds_df)} quote; {len(odds_best)} best prices.")
+            st.caption(f"Provider {odds_provider}; {len(selected_sports)} sport; {len(odds_df)} quote; {len(odds_best)} best prices.")
             if quota:
                 st.caption(f"Quota: remaining={quota.get('requests_remaining')} used={quota.get('requests_used')} last={quota.get('requests_last')}")
 
@@ -2063,8 +2394,8 @@ with tab_arb:
         "Per ora l'arbitraggio puro viene calcolato in modo sicuro su h2h, totals e btts quando disponibili."
     )
 
-    if not odds_api_key:
-        st.error("Inserisci The Odds API key.")
+    if not active_odds_key:
+        st.error("Inserisci la API key del provider selezionato.")
     elif not regions or not core_markets_selected:
         st.error("Seleziona almeno una regione e almeno un mercato core.")
     elif not selected_sports:
@@ -2086,11 +2417,9 @@ with tab_arb:
                 st.write("Alcuni sport/mercati extra possono non essere disponibili con il piano/API corrente. Gli errori non bloccano lo scanner.")
                 st.write(odds_errors[:30])
 
-        odds_df = flatten_odds(odds_events)
-
         st.caption(
-            f"Dataset bookmaker: {len(odds_events)} eventi odds da {len(selected_sports)} sport; "
-            f"{len(odds_df)} quote bookmaker."
+            f"Dataset bookmaker: provider {odds_provider}; {len(selected_sports)} sport; "
+            f"{len(odds_df)} quote bookmaker normalizzate."
         )
 
         if quota_rows:
@@ -2177,7 +2506,8 @@ with tab_setup:
 Aggiungi questa variabile nei secrets di Streamlit:
 
 ```toml
-ODDS_API_KEY = "la_tua_api_key"
+ODDS_API_KEY = "la_tua_api_key_the_odds_api"
+ODDS_API_IO_KEY = "la_tua_api_key_odds_api_io"
 ```
 
 ### Metodo
@@ -2206,6 +2536,14 @@ I segnali principali sono:
 Nel secondo caso l'app calcola anche lo stake plan teorico per distribuire il capitale tra i bookmaker.
 
 Da v1.7 l'app esclude i mercati Polymarket parziali come `first half`, `second half`, `quarter`, `period`, `inning`, quando li confronterebbe contro quote bookmaker full-game. Questo evita falsi positivi tipo `Both Teams to Score in Second Half` vs `BTTS full match`.
+
+Da v2.0 l'app supporta piu' provider quote:
+- The Odds API
+- Odds-API.io, adapter sperimentale
+
+Da v2.1 la protezione crediti API non modifica piu' i risultati: non taglia sport, non disattiva mercati e non cambia il matching. Ferma solo lo scanner quando i crediti sono quasi finiti. L'esclusione winner/outright e' ora un filtro separato ed esplicito.
+
+Da v1.9 e' stata introdotta la protezione anti-spreco quota.
 
 Da v1.8 la tabella mostra istruzioni operative esplicite:
 - cosa comprare su Polymarket;
