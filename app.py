@@ -13,7 +13,7 @@ import requests
 import streamlit as st
 
 
-APP_VERSION = "PolyKalshi Edge Scanner v3.2 - wider matching + diagnostics"
+APP_VERSION = "PolyKalshi Edge Scanner v3.4 - fast candidate matching + orderbooks after match"
 
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
@@ -178,6 +178,122 @@ def extract_dates(s: str) -> List[str]:
             found.add(f"{y:04d}-{mo:02d}-{d:02d}")
 
     return sorted(found)
+
+
+def extract_numbers_set(s: str) -> set:
+    """
+    Extracts relevant numeric thresholds: dates, prices, totals, percentages, years.
+    We keep strings to avoid float precision issues.
+    """
+    return set(re.findall(r"\b\d+(?:\.\d+)?\b", str(s or "").lower()))
+
+
+def extract_years_set(s: str) -> set:
+    return set(re.findall(r"\b20\d{2}\b", str(s or "")))
+
+
+def compact_entity_tokens(s: str) -> set:
+    """
+    Tokens used for entity overlap. Removes common market words.
+    """
+    bad = STOPWORDS | {
+        "above", "below", "over", "under", "yes", "no", "before", "after",
+        "january", "february", "march", "april", "june", "july", "august",
+        "september", "october", "november", "december", "jan", "feb", "mar",
+        "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    }
+    return {t for t in tokens(s) if t not in bad and not re.fullmatch(r"\d+(?:\.\d+)?", t)}
+
+
+def matching_text_from_market_row(row: Dict[str, Any]) -> str:
+    fields = [
+        row.get("title", ""),
+        row.get("ticker", ""),
+        row.get("category", ""),
+        row.get("event_date", ""),
+        row.get("dates_in_title", ""),
+    ]
+    return " ".join(str(x or "") for x in fields)
+
+
+def structured_score(poly_row: Dict[str, Any], kalshi_row: Dict[str, Any]) -> Tuple[float, str]:
+    """
+    Combines lexical score with entity/date/number checks.
+    This does not try to be perfect; it is designed to explain why a match is high/low.
+    """
+    ptxt = matching_text_from_market_row(poly_row)
+    ktxt = matching_text_from_market_row(kalshi_row)
+
+    base = text_similarity(ptxt, ktxt)
+
+    p_entities = compact_entity_tokens(ptxt)
+    k_entities = compact_entity_tokens(ktxt)
+    shared_entities = p_entities & k_entities
+    entity_overlap = len(shared_entities) / max(1, min(len(p_entities), len(k_entities)))
+
+    score = (0.70 * base) + (0.30 * entity_overlap)
+    reasons = [f"base={base:.3f}", f"entity_overlap={entity_overlap:.3f}"]
+
+    # Category boost/penalty.
+    if poly_row.get("category") and kalshi_row.get("category"):
+        if poly_row.get("category") == kalshi_row.get("category"):
+            score += 0.04
+            reasons.append("category_match=+0.04")
+        else:
+            score -= 0.04
+            reasons.append("category_mismatch=-0.04")
+
+    # Outcome type boost/penalty.
+    po = poly_row.get("outcome_type") or "binary"
+    ko = kalshi_row.get("outcome_type") or "binary"
+    if po != "binary" and ko != "binary":
+        if po == ko:
+            score += 0.04
+            reasons.append("outcome_type_match=+0.04")
+        else:
+            score *= 0.65
+            reasons.append("outcome_type_mismatch=*0.65")
+
+    # Date handling.
+    p_dates = set([x for x in [poly_row.get("event_date", "")] + str(poly_row.get("dates_in_title", "")).split(",") if x])
+    k_dates = set([x for x in [kalshi_row.get("event_date", "")] + str(kalshi_row.get("dates_in_title", "")).split(",") if x])
+    if p_dates and k_dates:
+        if p_dates & k_dates:
+            score += 0.05
+            reasons.append("date_match=+0.05")
+        else:
+            score *= 0.55
+            reasons.append("date_mismatch=*0.55")
+
+    # Numbers: if both have numbers and none overlap, strongly penalize.
+    p_nums = extract_numbers_set(ptxt)
+    k_nums = extract_numbers_set(ktxt)
+    if p_nums and k_nums:
+        if p_nums & k_nums:
+            score += 0.04
+            reasons.append("number_overlap=+0.04")
+        else:
+            # If only years differ this can be decisive.
+            score *= 0.60
+            reasons.append("number_mismatch=*0.60")
+
+    # Years: stronger penalty.
+    p_years = extract_years_set(ptxt)
+    k_years = extract_years_set(ktxt)
+    if p_years and k_years and not (p_years & k_years):
+        score *= 0.50
+        reasons.append("year_mismatch=*0.50")
+
+    # Need at least one meaningful shared entity unless lexical score is very high.
+    if not shared_entities and base < 0.72:
+        score *= 0.50
+        reasons.append("no_shared_entity=*0.50")
+
+    score = max(0.0, min(1.0, score))
+    if shared_entities:
+        reasons.append("shared=" + ",".join(sorted(list(shared_entities))[:10]))
+
+    return score, " | ".join(reasons)
 
 
 def parse_time_date(x: Any) -> str:
@@ -432,7 +548,10 @@ def polymarket_to_rows(markets: List[Dict[str, Any]], read_books: bool, max_book
             "source": "Polymarket",
             "id": str(m.get("id") or m.get("conditionId") or slug),
             "ticker": str(slug),
+            "yes_token": yes_token,
+            "no_token": no_token,
             "title": title_full,
+            "matching_text": " ".join([title_full, str(slug), str(m.get("description") or ""), str(m.get("category") or "")]),
             "category": category_from_text(title_full + " " + str(m.get("category", ""))),
             "event_date": date,
             "dates_in_title": ",".join(extract_dates(title_full + " " + slug)),
@@ -525,7 +644,10 @@ def kalshi_to_rows(markets: List[Dict[str, Any]]) -> pd.DataFrame:
         subtitle = str(m.get("subtitle") or m.get("sub_title") or "")
         event_title = str(m.get("event_title") or m.get("eventTitle") or m.get("event_ticker") or "")
 
+        series_title = str(m.get("series_title") or m.get("seriesTitle") or "")
+        rules_primary = str(m.get("rules_primary") or m.get("rulesPrimary") or "")
         full_title = " ".join([x for x in [event_title, title, subtitle] if x]).strip()
+        matching_text = " ".join([x for x in [event_title, series_title, title, subtitle, ticker, rules_primary] if x]).strip()
 
         yes_bid = normalize_price_unit(m.get("yes_bid") or m.get("yesBid"))
         yes_ask = normalize_price_unit(m.get("yes_ask") or m.get("yesAsk"))
@@ -550,7 +672,8 @@ def kalshi_to_rows(markets: List[Dict[str, Any]]) -> pd.DataFrame:
             "id": ticker,
             "ticker": ticker,
             "title": full_title,
-            "category": category_from_text(full_title + " " + str(m.get("category", ""))),
+            "matching_text": matching_text,
+            "category": category_from_text(matching_text + " " + str(m.get("category", ""))),
             "event_date": date,
             "dates_in_title": ",".join(extract_dates(full_title + " " + ticker)),
             "outcome_type": outcome_direction(full_title),
@@ -597,6 +720,126 @@ def outcome_type_ok(a: pd.Series, b: pd.Series) -> bool:
     return oa == ob
 
 
+def rough_candidate_score(p_meta: Dict[str, Any], k_meta: Dict[str, Any], same_category: bool, require_date_match: bool) -> float:
+    """
+    Very fast pre-score used only to choose candidate pairs before the expensive structured_score.
+    """
+    p_entities = p_meta["entities"]
+    k_entities = k_meta["entities"]
+
+    shared = p_entities & k_entities
+    entity_score = len(shared) / max(1, min(len(p_entities), len(k_entities)))
+
+    score = entity_score
+
+    if p_meta["category"] and p_meta["category"] == k_meta["category"]:
+        score += 0.15
+    elif same_category:
+        return -1.0
+
+    if p_meta["outcome_type"] != "binary" and k_meta["outcome_type"] != "binary":
+        if p_meta["outcome_type"] == k_meta["outcome_type"]:
+            score += 0.08
+        else:
+            score -= 0.25
+
+    p_dates = p_meta["dates"]
+    k_dates = k_meta["dates"]
+    if p_dates and k_dates:
+        if p_dates & k_dates:
+            score += 0.15
+        elif require_date_match:
+            return -1.0
+        else:
+            score -= 0.15
+
+    p_nums = p_meta["numbers"]
+    k_nums = k_meta["numbers"]
+    if p_nums and k_nums:
+        if p_nums & k_nums:
+            score += 0.10
+        else:
+            score -= 0.25
+
+    if not shared:
+        score -= 0.20
+
+    return score
+
+
+def build_market_meta(row: Dict[str, Any]) -> Dict[str, Any]:
+    txt = matching_text_from_market_row(row)
+    date_values = set([x for x in [row.get("event_date", "")] + str(row.get("dates_in_title", "")).split(",") if x])
+    return {
+        "text": txt,
+        "entities": compact_entity_tokens(txt),
+        "numbers": extract_numbers_set(txt),
+        "years": extract_years_set(txt),
+        "dates": date_values,
+        "category": row.get("category"),
+        "outcome_type": row.get("outcome_type") or "binary",
+    }
+
+
+def hydrate_matches_with_poly_books(matches: pd.DataFrame, max_books: int) -> pd.DataFrame:
+    """
+    Performance fix:
+    - Matching does not need Polymarket orderbooks.
+    - Read orderbooks only after candidate matches have been found.
+    - max_books counts token-book reads, so one market can consume 1 or 2 reads.
+    """
+    if matches.empty or max_books <= 0:
+        return matches
+
+    out = matches.copy()
+    book_cache: Dict[str, Tuple[Optional[Decimal], Optional[Decimal], str]] = {}
+    reads = 0
+    progress = st.progress(0, text="Leggo orderbook Polymarket solo sui match...")
+    total = max(1, len(out))
+
+    for n, idx in enumerate(out.index, start=1):
+        yes_token = str(out.at[idx, "poly_yes_token"] or "")
+        no_token = str(out.at[idx, "poly_no_token"] or "")
+
+        yes_bid = out.at[idx, "poly_yes_bid"]
+        yes_ask = out.at[idx, "poly_yes_ask"]
+        no_bid = out.at[idx, "poly_no_bid"]
+        no_ask = out.at[idx, "poly_no_ask"]
+
+        if yes_token and reads < max_books:
+            if yes_token not in book_cache:
+                book_cache[yes_token] = get_poly_book(yes_token)
+                reads += 1
+            yes_bid, yes_ask, _ = book_cache[yes_token]
+
+        if no_token and reads < max_books:
+            if no_token not in book_cache:
+                book_cache[no_token] = get_poly_book(no_token)
+                reads += 1
+            no_bid, no_ask, _ = book_cache[no_token]
+
+        if no_ask is None:
+            no_ask = infer_no_ask_from_yes_bid(yes_bid)
+        if no_bid is None:
+            no_bid = infer_yes_ask_from_no_bid(yes_ask)
+
+        out.at[idx, "poly_yes_bid"] = yes_bid
+        out.at[idx, "poly_yes_ask"] = yes_ask
+        out.at[idx, "poly_no_bid"] = no_bid
+        out.at[idx, "poly_no_ask"] = no_ask
+
+        if n % 10 == 0 or n == total:
+            progress.progress(n / total, text=f"Orderbook match {n}/{total} - token letti {reads}/{max_books}")
+
+        if reads >= max_books:
+            # Continue loop only to keep inferred values for already-read rows unnecessary; stop early for speed.
+            break
+
+    progress.empty()
+    st.caption(f"Orderbook Polymarket letti dopo matching: {reads} token.")
+    return out
+
+
 def build_matches(
     poly_df: pd.DataFrame,
     kalshi_df: pd.DataFrame,
@@ -604,20 +847,18 @@ def build_matches(
     max_matches: int,
     same_category: bool,
     require_date_match: bool = False,
-    diagnostic_limit: int = 100,
+    diagnostic_limit: int = 150,
+    max_candidates_per_poly: int = 80,
+    fallback_candidates: int = 120,
+    exhaustive_matching: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Wider matcher.
-
-    v3.1 was too strict:
-    - required shared tokens before scoring
-    - often required same estimated category
-    - date check was effectively too aggressive for markets that close/settle on different dates
-
-    v3.2:
-    - scores candidates even without shared token overlap
-    - category/date are optional filters only
-    - returns diagnostics with best near-matches below threshold
+    v3.4 performance matcher:
+    - precomputes metadata once;
+    - uses an inverted index on entity tokens;
+    - rough-scores candidates cheaply;
+    - runs expensive structured_score only on top N candidates;
+    - optional exhaustive mode for validation/debug.
     """
     rows = []
     diagnostic_rows = []
@@ -628,22 +869,45 @@ def build_matches(
     poly_records = list(poly_df.to_dict("records"))
     kalshi_records = list(kalshi_df.to_dict("records"))
 
-    progress = st.progress(0, text="Matching Polymarket ↔ Kalshi...")
+    kalshi_meta = [build_market_meta(k) for k in kalshi_records]
+    kalshi_by_volume = sorted(
+        range(len(kalshi_records)),
+        key=lambda ix: float(kalshi_records[ix].get("volume") or 0),
+        reverse=True,
+    )
+
+    token_index: Dict[str, List[int]] = {}
+    for idx, meta in enumerate(kalshi_meta):
+        for tok in list(meta["entities"])[:50]:
+            token_index.setdefault(tok, []).append(idx)
+
+    progress = st.progress(0, text="Matching veloce Polymarket ↔ Kalshi...")
     total = len(poly_records)
+    comparisons = 0
+    expensive_scores = 0
 
     for i, p in enumerate(poly_records, start=1):
         pser = pd.Series(p)
+        p_meta = build_market_meta(p)
 
-        candidates = kalshi_records
-        if same_category:
-            candidates = [k for k in candidates if k.get("category") == p.get("category")]
+        if exhaustive_matching:
+            candidate_indices = set(range(len(kalshi_records)))
+        else:
+            candidate_indices = set()
+            for tok in p_meta["entities"]:
+                candidate_indices.update(token_index.get(tok, []))
 
-        scored = []
-        p_title = p.get("title", "")
-        p_tokens = set(tokens(p_title))
+            # Fallback: do NOT scan all Kalshi. Use top liquid/active candidates only.
+            if not candidate_indices:
+                candidate_indices = set(kalshi_by_volume[:fallback_candidates])
 
-        for k in candidates:
+        rough = []
+        for idx in candidate_indices:
+            k = kalshi_records[idx]
             kser = pd.Series(k)
+
+            if same_category and k.get("category") != p.get("category"):
+                continue
 
             if require_date_match and not date_match_ok(pser, kser):
                 continue
@@ -651,32 +915,35 @@ def build_matches(
             if not outcome_type_ok(pser, kser):
                 continue
 
-            k_title = k.get("title", "")
-            k_tokens = set(tokens(k_title))
-            shared = p_tokens & k_tokens
+            rs = rough_candidate_score(p_meta, kalshi_meta[idx], same_category, require_date_match)
+            if rs < -0.10:
+                continue
 
-            sim = text_similarity(p_title, k_title)
+            rough.append((rs, idx))
 
-            if shared:
-                sim = min(1.0, sim + min(0.10, len(shared) * 0.015))
+        rough.sort(key=lambda x: x[0], reverse=True)
 
-            if p.get("category") == k.get("category"):
-                sim = min(1.0, sim + 0.03)
+        # Cap expensive scoring.
+        if not exhaustive_matching:
+            rough = rough[:max_candidates_per_poly]
 
-            if date_match_ok(pser, kser):
-                sim = min(1.0, sim + 0.02)
+        scored = []
+        for _, idx in rough:
+            k = kalshi_records[idx]
+            sim, reason = structured_score(p, k)
+            scored.append((sim, k, reason))
+            expensive_scores += 1
 
-            scored.append((sim, k, ",".join(sorted(list(shared))[:12])))
-
+        comparisons += len(rough)
         scored.sort(key=lambda x: x[0], reverse=True)
 
         if scored:
-            sim, k, shared_words = scored[0]
+            sim, k, reason = scored[0]
             diagnostic_rows.append({
                 "similarity": sim,
+                "score_reason": reason,
                 "category_poly": p.get("category"),
                 "category_kalshi": k.get("category"),
-                "shared_words": shared_words,
                 "poly_title": p.get("title"),
                 "kalshi_title": k.get("title"),
                 "poly_date": p.get("event_date"),
@@ -685,20 +952,22 @@ def build_matches(
                 "kalshi_url": k.get("url"),
             })
 
-        for sim, k, shared_words in scored[:5]:
+        for sim, k, reason in scored[:5]:
             if sim < min_similarity:
                 continue
 
             rows.append({
                 "similarity": sim,
-                "confidence": "Alta" if sim >= 0.78 else ("Media" if sim >= 0.62 else "Bassa"),
+                "confidence": "Alta" if sim >= 0.80 else ("Media" if sim >= 0.65 else "Bassa"),
+                "score_reason": reason,
                 "category": p.get("category"),
                 "kalshi_category": k.get("category"),
-                "shared_words": shared_words,
                 "outcome_type": p.get("outcome_type"),
                 "poly_title": p.get("title"),
                 "kalshi_title": k.get("title"),
                 "poly_ticker": p.get("ticker"),
+                "poly_yes_token": p.get("yes_token"),
+                "poly_no_token": p.get("no_token"),
                 "kalshi_ticker": k.get("ticker"),
                 "poly_date": p.get("event_date"),
                 "kalshi_date": k.get("event_date"),
@@ -720,14 +989,20 @@ def build_matches(
 
             if len(rows) >= max_matches:
                 progress.empty()
+                st.caption(f"Matching performance: {comparisons:,} candidati valutati; {expensive_scores:,} score completi.")
                 diag = pd.DataFrame(diagnostic_rows)
                 if not diag.empty:
                     diag = diag.sort_values("similarity", ascending=False).head(diagnostic_limit)
                 return pd.DataFrame(rows), diag
 
-        progress.progress(i / total, text=f"Matching {i}/{total}")
+        if i % 20 == 0 or i == total:
+            progress.progress(
+                i / total,
+                text=f"Matching veloce {i}/{total} | candidati {comparisons:,} | score completi {expensive_scores:,}"
+            )
 
     progress.empty()
+    st.caption(f"Matching performance: {comparisons:,} candidati valutati; {expensive_scores:,} score completi.")
     match_df = pd.DataFrame(rows)
     diag_df = pd.DataFrame(diagnostic_rows)
     if not diag_df.empty:
@@ -888,11 +1163,34 @@ with st.sidebar:
     kalshi_limit = st.slider("Kalshi da scaricare", 100, 5000, 1500, step=100)
 
     read_poly_books = st.checkbox(
-        "Leggi orderbook Polymarket live",
+        "Leggi orderbook Polymarket live dopo il matching",
         value=True,
-        help="Più preciso ma più lento. Kalshi usa i campi prezzo market-level."
+        help="v3.4: gli orderbook vengono letti solo sui match trovati, non su tutti i mercati. Molto più veloce."
     )
-    max_poly_books = st.slider("Max orderbook Polymarket da leggere", 50, 3000, 800, step=50)
+    max_poly_books = st.slider("Max token Polymarket da leggere dopo matching", 20, 3000, 400, step=20)
+
+    st.markdown("### Performance matching")
+    exhaustive_matching = st.checkbox(
+        "Confronto esaustivo Polymarket x Kalshi",
+        value=False,
+        help="Molto lento. Usalo solo per debug su dataset piccoli."
+    )
+    max_candidates_per_poly = st.slider(
+        "Max candidati Kalshi per mercato Polymarket",
+        20,
+        1000,
+        80,
+        step=20,
+        help="Più alto = più recall ma più lento. 60-120 è un buon range."
+    )
+    fallback_candidates = st.slider(
+        "Fallback candidati se non ci sono parole condivise",
+        20,
+        1000,
+        120,
+        step=20,
+        help="Evita di confrontare ogni Polymarket con tutti i Kalshi."
+    )
 
     min_similarity = st.slider("Similarità minima matching", 0.40, 0.95, 0.68, step=0.01)
     same_category = st.checkbox(
@@ -952,8 +1250,10 @@ with tab_scan:
         if kalshi_base:
             st.caption(f"Kalshi base URL usato: {kalshi_base}")
 
-        with st.spinner("Normalizzo Polymarket..."):
-            poly_df = polymarket_to_rows(poly_markets, read_poly_books, max_poly_books)
+        with st.spinner("Normalizzo Polymarket senza orderbook..."):
+            # Performance fix v3.4:
+            # orderbook is not needed for matching. We read it only after candidates are found.
+            poly_df = polymarket_to_rows(poly_markets, False, 0)
 
         with st.spinner("Normalizzo Kalshi..."):
             kalshi_df = kalshi_to_rows(kalshi_markets)
@@ -981,29 +1281,38 @@ with tab_scan:
                     same_category,
                     require_date_match,
                     diagnostic_limit=100,
+                    max_candidates_per_poly=max_candidates_per_poly,
+                    fallback_candidates=fallback_candidates,
+                    exhaustive_matching=exhaustive_matching,
                 )
 
             if matches.empty:
                 st.warning("Nessun match sopra la soglia. Qui sotto trovi i migliori quasi-match per capire se la soglia è troppo alta o se i dataset sono davvero diversi.")
                 if not diagnostics.empty:
                     diag_cols = [
-                        "similarity", "category_poly", "category_kalshi", "shared_words",
+                        "similarity", "category_poly", "category_kalshi", "score_reason",
                         "poly_title", "kalshi_title", "poly_date", "kalshi_date", "poly_url", "kalshi_url"
                     ]
                     st.markdown("### Diagnostica migliori quasi-match")
                     st.dataframe(diagnostics[diag_cols].head(100), width="stretch", hide_index=True)
             else:
+                if read_poly_books:
+                    with st.spinner("Leggo orderbook Polymarket solo sui match trovati..."):
+                        matches = hydrate_matches_with_poly_books(matches, max_poly_books)
+                else:
+                    st.info("Orderbook Polymarket live disattivato: il matching è più veloce, ma arbitraggio può avere prezzi Polymarket mancanti.")
+
                 if 'diagnostics' in locals() and not diagnostics.empty:
                     with st.expander("Diagnostica migliori quasi-match"):
                         diag_cols = [
-                            "similarity", "category_poly", "category_kalshi", "shared_words",
+                            "similarity", "category_poly", "category_kalshi", "score_reason",
                             "poly_title", "kalshi_title", "poly_date", "kalshi_date", "poly_url", "kalshi_url"
                         ]
                         st.dataframe(diagnostics[diag_cols].head(100), width="stretch", hide_index=True)
 
                 st.markdown("### Match trovati")
                 match_cols = [
-                    "confidence", "similarity", "category", "kalshi_category", "shared_words", "outcome_type",
+                    "confidence", "similarity", "category", "kalshi_category", "score_reason", "outcome_type",
                     "poly_title", "kalshi_title", "poly_date", "kalshi_date",
                     "poly_yes_ask", "poly_no_ask", "kalshi_yes_ask", "kalshi_no_ask",
                     "poly_url", "kalshi_url"
@@ -1015,7 +1324,7 @@ with tab_scan:
 
                 show_cols = [
                     "azione_operativa", "roi_%", "profitto_teorico_$", "costo_combo", "payout_garantito_$",
-                    "confidence", "similarity", "category", "kalshi_category", "shared_words", "outcome_type",
+                    "confidence", "similarity", "category", "kalshi_category", "score_reason", "outcome_type",
                     "poly_title", "kalshi_title",
                     "poly_yes_ask", "poly_no_ask", "kalshi_yes_ask", "kalshi_no_ask",
                     "best_yes_platform", "best_yes_price", "best_no_platform", "best_no_price",
@@ -1083,9 +1392,28 @@ with tab_setup:
 
     st.markdown(
         """
+### Fix v3.4
+
+Performance:
+- non legge più gli orderbook Polymarket prima del matching;
+- legge gli orderbook solo sui match trovati;
+- usa inverted index su entità/parole importanti;
+- limita i candidati Kalshi per ogni mercato Polymarket;
+- confronto esaustivo disponibile solo come opzione debug.
+
+### Fix v3.3
+
+Il matching ora usa uno score spiegabile:
+- similarità testuale;
+- overlap entità;
+- controllo numeri/soglie;
+- controllo anni/date;
+- penalità se non ci sono entità condivise;
+- spiegazione `score_reason` per ogni match.
+
 ### Fix v3.2
 
-Il matching ora è molto meno rigido:
+Il matching è meno rigido:
 - stessa categoria disattivata di default;
 - stessa data disattivata di default;
 - nessuno scarto automatico se non ci sono parole identiche;
